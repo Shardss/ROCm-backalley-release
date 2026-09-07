@@ -1,0 +1,9 @@
+llama.cpp frozen base for rocm-backalley v1
+
+commit : 73a43d1f69345aee8bb186ef4b3172cef892f2e5
+date   : 2026-09-06 11:45 UTC
+tag    : backalley-base
+subject: cuda: fixes races in mmid and mmf (#28475)
+
+Every measurement in this repository is against this commit.
+It does not move until a new release is cut.
