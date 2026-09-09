@@ -1,0 +1,45 @@
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 10828ad..660e1d8 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -120,6 +120,7 @@ if (CUDAToolkit_FOUND)
+         list(APPEND GGML_SOURCES_CUDA
+             template-instances/fattn-vec-instance-f16-f16.cu
+             template-instances/fattn-vec-instance-q4_0-q4_0.cu
++            template-instances/fattn-vec-instance-q8_0-q4_0.cu
+             template-instances/fattn-vec-instance-q8_0-q8_0.cu
+             template-instances/fattn-vec-instance-bf16-bf16.cu)
+     endif()
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ae217fb..d761898 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -453,6 +453,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+ #else
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+ #endif // GGML_CUDA_FA_ALL_QUANTS
+@@ -573,7 +574,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     }
+ 
+ #ifndef GGML_CUDA_FA_ALL_QUANTS
+-    if (K->type != V->type) {
++    if (K->type != V->type && (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0)) {
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ #endif // GGML_CUDA_FA_ALL_QUANTS
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index 47f16f5..475172e 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -79,6 +79,7 @@ else()
+         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q4_0.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+ endif()
+ 

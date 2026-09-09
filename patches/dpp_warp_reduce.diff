@@ -1,0 +1,67 @@
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -445,11 +445,36 @@
+         f(0, args...);
+     }
+ };
++
++// AMD: DPP-based cross-lane reduction. row_shr within a row of 16 lanes, then
++// permlanex16 / permlane64 across rows. Replaces the generic shuffle loop, which
++// costs log2(width) full cross-lane ops (6 on wave64).
++#if defined(GGML_USE_HIP) && defined(__gfx1100__) || defined(GGML_USE_HIP) && defined(__gfx1101__) || \
++    defined(GGML_USE_HIP) && defined(__gfx1102__) || defined(GGML_USE_HIP) && defined(__gfx1200__) || \
++    defined(GGML_USE_HIP) && defined(__gfx1201__)
++#define GGML_HIP_DPP_REDUCE
++#endif
+ 
++#ifdef GGML_HIP_DPP_REDUCE
++template<int width>
++static __device__ __forceinline__ int amd_dpp_reduce_add(int x) {
++    // reduce within each group of 16 lanes using row_shr DPP
++    if (width >= 2)  x += __hip_ds_swizzle(x, 0x041F); // xor 1
++    if (width >= 4)  x += __hip_ds_swizzle(x, 0x081F); // xor 2
++    if (width >= 8)  x += __hip_ds_swizzle(x, 0x101F); // xor 4
++    if (width >= 16) x += __hip_ds_swizzle(x, 0x201F); // xor 8
++    if (width >= 32) x += __builtin_amdgcn_permlanex16(x, x, 0xFFFFFFFF, 0xFFFFFFFF, false, false);
++    if (width >= 64) x += __builtin_amdgcn_permlane64(x);
++    return x;
++}
++#endif // GGML_HIP_DPP_REDUCE
++
+ template<int width = WARP_SIZE>
+ static __device__ __forceinline__ int warp_reduce_sum(int x) {
+ #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+     return __reduce_add_sync(0xffffffff, x);
++#elif defined(GGML_HIP_DPP_REDUCE)
++    return amd_dpp_reduce_add<width>(x);
+ #else
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+@@ -461,11 +486,27 @@
+ 
+ template<int width = WARP_SIZE>
+ static __device__ __forceinline__ float warp_reduce_sum(float x) {
++#ifdef GGML_HIP_DPP_REDUCE
++    if (width >= 2)  x += __hip_ds_swizzlef(x, 0x041F);
++    if (width >= 4)  x += __hip_ds_swizzlef(x, 0x081F);
++    if (width >= 8)  x += __hip_ds_swizzlef(x, 0x101F);
++    if (width >= 16) x += __hip_ds_swizzlef(x, 0x201F);
++    if (width >= 32) {
++        int t = __builtin_amdgcn_permlanex16(__float_as_int(x), __float_as_int(x), 0xFFFFFFFF, 0xFFFFFFFF, false, false);
++        x += __int_as_float(t);
++    }
++    if (width >= 64) {
++        int t = __builtin_amdgcn_permlane64(__float_as_int(x));
++        x += __int_as_float(t);
++    }
++    return x;
++#else
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+         x += __shfl_xor_sync(0xffffffff, x, offset, width);
+     }
+     return x;
++#endif // GGML_HIP_DPP_REDUCE
+ }
+ 
+ template<int width = WARP_SIZE>

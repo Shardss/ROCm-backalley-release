@@ -1,0 +1,2089 @@
+diff --git a/ggml/src/ggml-cuda/binbcast.cu b/ggml/src/ggml-cuda/binbcast.cu
+index 2e38077bf67f..4ee0da6853b8 100644
+--- a/ggml/src/ggml-cuda/binbcast.cu
++++ b/ggml/src/ggml-cuda/binbcast.cu
+@@ -26,6 +26,56 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
+     return a / b;
+ }
+ 
++static __device__ __forceinline__ size_t ggml_cuda_index_4d(
++        const int64_t i0, const int64_t i1, const int64_t i2, const int64_t i3,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
++        const int64_t s0,  const int64_t s1,  const int64_t s2,  const int64_t s3) {
++    return size_t(i0 % ne0) * s0 + size_t(i1 % ne1) * s1 + size_t(i2 % ne2) * s2 + size_t(i3 % ne3) * s3;
++}
++
++static __global__ void k_fused_add_mul_f32(
++        const float * __restrict__ src0,
++        const float * __restrict__ src1,
++        const float * __restrict__ scale,
++        float * __restrict__ dst,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
++        const int64_t s0_ne0, const int64_t s0_ne1, const int64_t s0_ne2, const int64_t s0_ne3,
++        const int64_t s0_s0,  const int64_t s0_s1,  const int64_t s0_s2,  const int64_t s0_s3,
++        const int64_t s1_ne0, const int64_t s1_ne1, const int64_t s1_ne2, const int64_t s1_ne3,
++        const int64_t s1_s0,  const int64_t s1_s1,  const int64_t s1_s2,  const int64_t s1_s3,
++        const int64_t sc_ne0, const int64_t sc_ne1, const int64_t sc_ne2, const int64_t sc_ne3,
++        const int64_t sc_s0,  const int64_t sc_s1,  const int64_t sc_s2,  const int64_t sc_s3) {
++    const int64_t idx   = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    const int64_t total = ne0 * ne1 * ne2 * ne3;
++    if (idx >= total) {
++        return;
++    }
++
++    const int64_t i0 = idx % ne0;
++    const int64_t t1 = idx / ne0;
++    const int64_t i1 = t1 % ne1;
++    const int64_t t2 = t1 / ne1;
++    const int64_t i2 = t2 % ne2;
++    const int64_t i3 = t2 / ne2;
++
++    const size_t is0 = ggml_cuda_index_4d(i0, i1, i2, i3, s0_ne0, s0_ne1, s0_ne2, s0_ne3, s0_s0, s0_s1, s0_s2, s0_s3);
++    const size_t is1 = ggml_cuda_index_4d(i0, i1, i2, i3, s1_ne0, s1_ne1, s1_ne2, s1_ne3, s1_s0, s1_s1, s1_s2, s1_s3);
++    const size_t isc = ggml_cuda_index_4d(i0, i1, i2, i3, sc_ne0, sc_ne1, sc_ne2, sc_ne3, sc_s0, sc_s1, sc_s2, sc_s3);
++    dst[idx] = (src0[is0] + src1[is1]) * scale[isc];
++}
++
++static __global__ void k_fused_add_mul_contig_f32(
++        const float * __restrict__ src0,
++        const float * __restrict__ src1,
++        const float * __restrict__ scale,
++        float * __restrict__ dst,
++        const int64_t total) {
++    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (idx < total) {
++        dst[idx] = (src0[idx] + src1[idx]) * scale[idx];
++    }
++}
++
+ template <float (*bin_op)(const float, const float),
+           typename src0_t,
+           typename src1_t,
+@@ -572,3 +622,48 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         } break;
+     }
+ }
++
++void ggml_cuda_op_fused_add_mul(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * scale,
++        ggml_tensor * dst) {
++    GGML_ASSERT(src0->type == GGML_TYPE_F32);
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(scale->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_can_repeat(src0, dst));
++    GGML_ASSERT(ggml_can_repeat(src1, dst));
++    GGML_ASSERT(ggml_can_repeat(scale, dst));
++    GGML_ASSERT(ggml_is_contiguous(src0));
++    GGML_ASSERT(ggml_is_contiguous(src1));
++    GGML_ASSERT(ggml_is_contiguous(scale));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++
++    const int64_t total = ggml_nelements(dst);
++    const int block = 256;
++    const int64_t grid = (total + block - 1) / block;
++    GGML_ASSERT(grid <= std::numeric_limits<uint32_t>::max());
++
++    const auto stride = [](const ggml_tensor * t, int dim) {
++        return int64_t(t->nb[dim] / ggml_element_size(t));
++    };
++
++    const ggml_cuda_kernel_launch_params launch_params(dim3((uint32_t) grid), block, 0, ctx.stream());
++    if (ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src1, dst) && ggml_are_same_shape(scale, dst)) {
++        ggml_cuda_kernel_launch(k_fused_add_mul_contig_f32, launch_params,
++            (const float *) src0->data, (const float *) src1->data, (const float *) scale->data, (float *) dst->data, total);
++        return;
++    }
++
++    ggml_cuda_kernel_launch(k_fused_add_mul_f32, launch_params,
++        (const float *) src0->data, (const float *) src1->data, (const float *) scale->data, (float *) dst->data,
++        dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
++        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
++        stride(src0, 0), stride(src0, 1), stride(src0, 2), stride(src0, 3),
++        src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
++        stride(src1, 0), stride(src1, 1), stride(src1, 2), stride(src1, 3),
++        scale->ne[0], scale->ne[1], scale->ne[2], scale->ne[3],
++        stride(scale, 0), stride(scale, 1), stride(scale, 2), stride(scale, 3));
++}
+diff --git a/ggml/src/ggml-cuda/binbcast.cuh b/ggml/src/ggml-cuda/binbcast.cuh
+index 12624785b444..2e4158339260 100644
+--- a/ggml/src/ggml-cuda/binbcast.cuh
++++ b/ggml/src/ggml-cuda/binbcast.cuh
+@@ -10,3 +10,10 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+ 
+ void ggml_cuda_op_fused_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
+ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
++
++void ggml_cuda_op_fused_add_mul(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0,
++    const ggml_tensor * src1,
++    const ggml_tensor * scale,
++    ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 45e9537f0e45..ec65b1674638 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -28,6 +28,7 @@
+ #include "ggml-cuda/fwht.cuh"
+ #include "ggml-cuda/getrows.cuh"
+ #include "ggml-cuda/im2col.cuh"
++#include "ggml-cuda/lerp.cuh"
+ #include "ggml-cuda/mmf.cuh"
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+@@ -43,6 +44,7 @@
+ #include "ggml-cuda/quantize.cuh"
+ #include "ggml-cuda/rope.cuh"
+ #include "ggml-cuda/roll.cuh"
++#include "ggml-cuda/rwkv-fusion.cuh"
+ #include "ggml-cuda/scale.cuh"
+ #include "ggml-cuda/snake.cuh"
+ #include "ggml-cuda/softcap.cuh"
+@@ -3171,7 +3173,162 @@ static bool ggml_cuda_match_moe_weighted_reduction(
+     return true;
+ }
+ 
++static bool ggml_cuda_should_fuse_lerp(
++        const ggml_tensor * sub,
++        const ggml_tensor * repeat,
++        const ggml_tensor * mul,
++        const ggml_tensor * add,
++        const ggml_tensor ** x_prev,
++        const ggml_tensor ** cur,
++        const ggml_tensor ** weight) {
++    const ggml_tensor * delta = sub;
++    if (repeat) {
++        if (repeat->src[0] != sub) {
++            return false;
++        }
++        delta = repeat;
++    }
++
++    const ggml_tensor * w = nullptr;
++    if (mul->src[0] == delta) {
++        w = mul->src[1];
++    } else if (mul->src[1] == delta) {
++        w = mul->src[0];
++    } else {
++        return false;
++    }
++
++    const ggml_tensor * c = nullptr;
++    if (add->src[0] == mul) {
++        c = add->src[1];
++    } else if (add->src[1] == mul) {
++        c = add->src[0];
++    } else {
++        return false;
++    }
++
++    if (c != sub->src[1]) {
++        return false;
++    }
++
++    const ggml_tensor * xp = sub->src[0];
++    if (xp->type != GGML_TYPE_F32 || c->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_can_repeat(xp, add) || !ggml_can_repeat(c, add) || !ggml_can_repeat(w, add)) {
++        return false;
++    }
++    if (!ggml_is_contiguous(xp) || !ggml_is_contiguous(c) || !ggml_is_contiguous(w) || !ggml_is_contiguous(add)) {
++        return false;
++    }
++
++    *x_prev = xp;
++    *cur     = c;
++    *weight  = w;
++    return true;
++}
++static bool ggml_cuda_should_fuse_key_adjust(
++        const ggml_tensor * ka,
++        const ggml_tensor * a_ka,
++        const ggml_tensor * delta,
++        const ggml_tensor * add,
++        const ggml_tensor ** k,
++        const ggml_tensor ** a,
++        const ggml_tensor ** k_a) {
++    if (delta->src[0] != a_ka || delta->src[1] != ka) {
++        return false;
++    }
++
++    const ggml_tensor * av = a_ka->src[0] == ka ? a_ka->src[1] :
++                              a_ka->src[1] == ka ? a_ka->src[0] : nullptr;
++    const ggml_tensor * kv = add->src[0] == delta ? add->src[1] :
++                              add->src[1] == delta ? add->src[0] : nullptr;
++    if (!av || !kv) {
++        return false;
++    }
++
++    const ggml_tensor * kav = ka->src[0] == kv ? ka->src[1] :
++                               ka->src[1] == kv ? ka->src[0] : nullptr;
++    if (!kav ||
++        kv->type   != GGML_TYPE_F32 ||
++        av->type   != GGML_TYPE_F32 ||
++        kav->type  != GGML_TYPE_F32 ||
++        ka->type   != GGML_TYPE_F32 ||
++        a_ka->type != GGML_TYPE_F32 ||
++        delta->type != GGML_TYPE_F32 ||
++        add->type   != GGML_TYPE_F32) {
++        return false;
++    }
++
++    if (!ggml_are_same_shape(kv, av) ||
++        !ggml_are_same_shape(kv, add) ||
++        kav->ne[0] != add->ne[0] ||
++        ggml_nelements(kav) != add->ne[0]) {
++        return false;
++    }
++
++    if (!ggml_is_contiguous(kv) ||
++        !ggml_is_contiguous(av) ||
++        !ggml_is_contiguous(kav) ||
++        !ggml_is_contiguous(add)) {
++        return false;
++    }
++
++    *k   = kv;
++    *a   = av;
++    *k_a = kav;
++    return true;
++}
++static bool ggml_cuda_should_fuse_add_mul(
++        const ggml_tensor * add,
++        const ggml_tensor * mul,
++        const ggml_tensor ** src0,
++        const ggml_tensor ** src1,
++        const ggml_tensor ** scale) {
++    const ggml_tensor * s = nullptr;
++    if (mul->src[0] == add) {
++        s = mul->src[1];
++    } else if (mul->src[1] == add) {
++        s = mul->src[0];
++    } else {
++        return false;
++    }
++
++    const ggml_tensor * a = add->src[0];
++    const ggml_tensor * b = add->src[1];
++    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_can_repeat(a, mul) || !ggml_can_repeat(b, mul) || !ggml_can_repeat(s, mul)) {
++        return false;
++    }
++    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(s) || !ggml_is_contiguous(mul)) {
++        return false;
++    }
+ 
++    *src0  = a;
++    *src1  = b;
++    *scale = s;
++    return true;
++}
++
++static bool ggml_cuda_check_elementwise_aliasing(
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        const ggml_tensor * scale,
++        const ggml_tensor * dst) {
++    const auto tensors_overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const uintptr_t a_start = reinterpret_cast<uintptr_t>(a->data);
++        const uintptr_t b_start = reinterpret_cast<uintptr_t>(b->data);
++        const uintptr_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++        const uintptr_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++        return a_start < b_end && b_start < a_end;
++    };
++    const auto safe = [dst, &tensors_overlap](const ggml_tensor * src) {
++        return !tensors_overlap(dst, src);
++    };
++    return safe(src0) && safe(src1) && safe(scale);
++}
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -3265,8 +3422,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return false;
+     }
+ 
+-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+-        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
++    if ((ops.size() == 2 || ops.size() == 3) &&
++        (ops.begin()[0] == GGML_OP_NORM || ops.begin()[0] == GGML_OP_RMS_NORM) && ops.begin()[1] == GGML_OP_MUL) {
++        const ggml_tensor * norm = cgraph->nodes[node_idx];
+         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
+         const ggml_tensor *add      = nullptr;
+ 
+@@ -3274,8 +3432,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+             add = cgraph->nodes[node_idx+2];
+         }
+ 
+-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
++        GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
++        GGML_ASSERT(norm->type == GGML_TYPE_F32);
+ 
+         //rms norm only supports F32
+         if (mul->src[0]->type != GGML_TYPE_F32 ||
+@@ -3291,7 +3449,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         }
+ 
+         //if rms norm is the B operand, then we don't handle broadcast
+-        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
++        if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
+             return false;
+         }
+ 
+@@ -3431,6 +3589,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 0;
+     }
+ 
++    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_ADD }, { i + 3 })) {
++        const ggml_tensor * k   = nullptr;
++        const ggml_tensor * a   = nullptr;
++        const ggml_tensor * k_a = nullptr;
++        if (ggml_cuda_should_fuse_key_adjust(
++                    cgraph->nodes[i], cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
++                    &k, &a, &k_a)) {
++            const int out_nodes[] = { i + 3 };
++            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
++                ggml_cuda_op_key_adjust_fused(*cuda_ctx, k, a, k_a, cgraph->nodes[i + 3]);
++                return 3;
++            }
++        }
++    }
++
++    const auto try_lerp = [&](const ggml_tensor * repeat, int n_nodes) {
++        const ggml_tensor * x_prev = nullptr;
++        const ggml_tensor * cur    = nullptr;
++        const ggml_tensor * weight = nullptr;
++        const int mul_idx = i + n_nodes - 2;
++        const int add_idx = i + n_nodes - 1;
++
++        if (!ggml_cuda_should_fuse_lerp(cgraph->nodes[i], repeat, cgraph->nodes[mul_idx], cgraph->nodes[add_idx],
++                                        &x_prev, &cur, &weight)) {
++            return 0;
++        }
++
++        const int out_nodes[] = { add_idx };
++        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_nodes, out_nodes, 1)) {
++            return 0;
++        }
++
++        ggml_cuda_op_lerp_fused(*cuda_ctx, x_prev, cur, weight, cgraph->nodes[add_idx]);
++        return n_nodes - 1;
++    };
++
++    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SUB, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, { i + 3 })) {
++        const int nodes_to_skip = try_lerp(cgraph->nodes[i + 1], 4);
++        if (nodes_to_skip) {
++            return nodes_to_skip;
++        }
++    }
++
++    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
++        const int nodes_to_skip = try_lerp(nullptr, 3);
++        if (nodes_to_skip) {
++            return nodes_to_skip;
++        }
++    }
++
+     ggml_tensor * node = cgraph->nodes[i];
+ 
+     if (node->op == GGML_OP_MUL) {
+@@ -3445,6 +3653,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    int add_mul_idx = i + 1;
++    while (add_mul_idx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[add_mul_idx])) {
++        ++add_mul_idx;
++    }
++
++    const int add_mul_nodes[] = { i, add_mul_idx };
++    const ggml_op add_mul_ops[] = { GGML_OP_ADD, GGML_OP_MUL };
++    const int add_mul_outputs[] = { add_mul_idx };
++    if (add_mul_idx < cgraph->n_nodes &&
++            ggml_can_fuse_subgraph_ext(cgraph, add_mul_nodes, 2, add_mul_ops, add_mul_outputs, 1)) {
++        const ggml_tensor * src0  = nullptr;
++        const ggml_tensor * src1  = nullptr;
++        const ggml_tensor * scale = nullptr;
++        ggml_tensor * mul = cgraph->nodes[add_mul_idx];
++
++        if (ggml_cuda_should_fuse_add_mul(node, mul, &src0, &src1, &scale) &&
++                ggml_cuda_check_elementwise_aliasing(src0, src1, scale, mul)) {
++            ggml_cuda_op_fused_add_mul(*cuda_ctx, src0, src1, scale, mul);
++            return add_mul_idx - i;
++        }
++    }
++
+     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+     if (node->op == GGML_OP_GATED_DELTA_NET) {
+         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+@@ -3975,6 +4205,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
++        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        return 2;
++    }
++
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
++        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr);
++        return 1;
++    }
++
+     fused_mul_mat_vec = false;
+     fused_node_count  = 0;
+ 
+diff --git a/ggml/src/ggml-cuda/lerp.cu b/ggml/src/ggml-cuda/lerp.cu
+new file mode 100644
+index 000000000000..da50b872e7c1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lerp.cu
+@@ -0,0 +1,120 @@
++#include "lerp.cuh"
++
++#include <cstdint>
++#include <limits>
++
++static __device__ __forceinline__ size_t ggml_cuda_index_4d(
++        const int64_t i0, const int64_t i1, const int64_t i2, const int64_t i3,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
++        const int64_t s0,  const int64_t s1,  const int64_t s2,  const int64_t s3) {
++    return size_t(i0 % ne0) * s0 + size_t(i1 % ne1) * s1 + size_t(i2 % ne2) * s2 + size_t(i3 % ne3) * s3;
++}
++
++static __global__ void k_lerp_fused_f32(
++        const float * __restrict__ x_prev,
++        const float * __restrict__ cur,
++        const float * __restrict__ weight,
++        float * __restrict__ dst,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
++        const int64_t xp_ne0, const int64_t xp_ne1, const int64_t xp_ne2, const int64_t xp_ne3,
++        const int64_t xp_s0,  const int64_t xp_s1,  const int64_t xp_s2,  const int64_t xp_s3,
++        const int64_t c_ne0,  const int64_t c_ne1,  const int64_t c_ne2,  const int64_t c_ne3,
++        const int64_t c_s0,   const int64_t c_s1,   const int64_t c_s2,   const int64_t c_s3,
++        const int64_t w_ne0,  const int64_t w_ne1,  const int64_t w_ne2,  const int64_t w_ne3,
++        const int64_t w_s0,   const int64_t w_s1,   const int64_t w_s2,   const int64_t w_s3) {
++    const int64_t idx   = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    const int64_t total = ne0 * ne1 * ne2 * ne3;
++
++    if (idx >= total) {
++        return;
++    }
++
++    const int64_t i0 = idx % ne0;
++    const int64_t t1 = idx / ne0;
++    const int64_t i1 = t1 % ne1;
++    const int64_t t2 = t1 / ne1;
++    const int64_t i2 = t2 % ne2;
++    const int64_t i3 = t2 / ne2;
++
++    const size_t ixp = ggml_cuda_index_4d(i0, i1, i2, i3, xp_ne0, xp_ne1, xp_ne2, xp_ne3, xp_s0, xp_s1, xp_s2, xp_s3);
++    const size_t ic  = ggml_cuda_index_4d(i0, i1, i2, i3, c_ne0,  c_ne1,  c_ne2,  c_ne3,  c_s0,  c_s1,  c_s2,  c_s3);
++    const size_t iw  = ggml_cuda_index_4d(i0, i1, i2, i3, w_ne0,  w_ne1,  w_ne2,  w_ne3,  w_s0,  w_s1,  w_s2,  w_s3);
++
++    const float c = cur[ic];
++    dst[idx] = c + (x_prev[ixp] - c) * weight[iw];
++}
++
++static __global__ void k_lerp_fused_contig_f32(
++        const float * __restrict__ x_prev,
++        const float * __restrict__ cur,
++        const float * __restrict__ weight,
++        float * __restrict__ dst,
++        const int64_t ne0,
++        const int64_t base_total) {
++    const int64_t ibase = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (ibase >= base_total) {
++        return;
++    }
++
++    const int64_t imix = blockIdx.y;
++    const int64_t i0   = ibase % ne0;
++    const float c = cur[ibase];
++    dst[imix * base_total + ibase] = c + (x_prev[ibase] - c) * weight[imix * ne0 + i0];
++}
++
++void ggml_cuda_op_lerp_fused(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * x_prev,
++        const ggml_tensor * cur,
++        const ggml_tensor * weight,
++        ggml_tensor * dst) {
++    GGML_ASSERT(x_prev->type == GGML_TYPE_F32);
++    GGML_ASSERT(cur->type    == GGML_TYPE_F32);
++    GGML_ASSERT(weight->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_can_repeat(x_prev, dst));
++    GGML_ASSERT(ggml_can_repeat(cur, dst));
++    GGML_ASSERT(ggml_can_repeat(weight, dst));
++    GGML_ASSERT(ggml_is_contiguous(x_prev));
++    GGML_ASSERT(ggml_is_contiguous(cur));
++    GGML_ASSERT(ggml_is_contiguous(weight));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++
++    const int64_t total      = ggml_nelements(dst);
++    const int64_t base_total = ggml_nelements(x_prev);
++    const int64_t n_mix      = dst->ne[3];
++    const int block = 256;
++
++    if (ggml_are_same_shape(x_prev, cur) &&
++            dst->ne[0] == x_prev->ne[0] && dst->ne[1] == x_prev->ne[1] && dst->ne[2] == x_prev->ne[2] &&
++            total == base_total * n_mix &&
++            weight->ne[0] == dst->ne[0] && weight->ne[1] == 1 && weight->ne[2] == 1 && weight->ne[3] == n_mix) {
++        const int64_t grid = (base_total + block - 1) / block;
++        GGML_ASSERT(grid <= std::numeric_limits<uint32_t>::max());
++        GGML_ASSERT(n_mix <= std::numeric_limits<uint32_t>::max());
++
++        const ggml_cuda_kernel_launch_params launch_params(dim3((uint32_t) grid, (uint32_t) n_mix), block, 0, ctx.stream());
++        ggml_cuda_kernel_launch(k_lerp_fused_contig_f32, launch_params,
++                (const float *) x_prev->data, (const float *) cur->data, (const float *) weight->data,
++                (float *) dst->data, dst->ne[0], base_total);
++        return;
++    }
++
++    const int64_t grid = (total + block - 1) / block;
++    GGML_ASSERT(grid <= std::numeric_limits<uint32_t>::max());
++
++    auto stride = [](const ggml_tensor * t, int dim) {
++        return int64_t(t->nb[dim] / ggml_element_size(t));
++    };
++
++    const ggml_cuda_kernel_launch_params launch_params(dim3((uint32_t) grid), block, 0, ctx.stream());
++    ggml_cuda_kernel_launch(k_lerp_fused_f32, launch_params,
++            (const float *) x_prev->data, (const float *) cur->data, (const float *) weight->data, (float *) dst->data,
++            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
++            x_prev->ne[0], x_prev->ne[1], x_prev->ne[2], x_prev->ne[3],
++            stride(x_prev, 0), stride(x_prev, 1), stride(x_prev, 2), stride(x_prev, 3),
++            cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
++            stride(cur, 0), stride(cur, 1), stride(cur, 2), stride(cur, 3),
++            weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3],
++            stride(weight, 0), stride(weight, 1), stride(weight, 2), stride(weight, 3));
++}
+diff --git a/ggml/src/ggml-cuda/lerp.cuh b/ggml/src/ggml-cuda/lerp.cuh
+new file mode 100644
+index 000000000000..d7f4f01ee60e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/lerp.cuh
+@@ -0,0 +1,8 @@
++#include "common.cuh"
++
++void ggml_cuda_op_lerp_fused(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * x_prev,
++    const ggml_tensor * cur,
++    const ggml_tensor * weight,
++    ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index c3758cd50cfe..005db335adf8 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,10 +1,26 @@
+ #include "norm.cuh"
+ #include <cstdint>
+ 
+-template <int block_size>
++template <int block_size, bool do_multiply = false, bool do_add = false>
+ static __global__ void norm_f32(
+         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+-        const int64_t stride_sample, const float eps) {
++        const int64_t stride_sample, const float eps,
++        const float * mul                  = nullptr,
++        const int64_t mul_stride_row       = 0,
++        const int64_t mul_stride_channel   = 0,
++        const int64_t mul_stride_sample    = 0,
++        const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
++        const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
++        const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
++        const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
++        const float * add                  = nullptr,
++        const int64_t add_stride_row       = 0,
++        const int64_t add_stride_channel   = 0,
++        const int64_t add_stride_sample    = 0,
++        const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
++        const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
++        const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
++        const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+     const int nrows     = gridDim.x;
+     const int nchannels = gridDim.y;
+ 
+@@ -16,6 +32,19 @@ static __global__ void norm_f32(
+     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+ 
++    static_assert(!do_add || do_multiply, "fusing add requires multiplying");
++
++    if constexpr (do_multiply) {
++        mul += fastmodulo(sample, mul_nsamples_packed) * mul_stride_sample +
++               fastmodulo(channel, mul_nchannels_packed) * mul_stride_channel +
++               fastmodulo(row, mul_nrows_packed) * mul_stride_row;
++    }
++    if constexpr (do_add) {
++        add += fastmodulo(sample, add_nsamples_packed) * add_stride_sample +
++               fastmodulo(channel, add_nchannels_packed) * add_stride_channel +
++               fastmodulo(row, add_nrows_packed) * add_stride_row;
++    }
++
+     float2 mean_var = make_float2(0.0f, 0.0f);
+ 
+     ggml_cuda_pdl_sync();
+@@ -34,7 +63,14 @@ static __global__ void norm_f32(
+     const float inv_std = rsqrtf(var + eps);
+ 
+     for (int col = tid; col < ncols; col += block_size) {
+-        dst[col] = (x[col] - mean) * inv_std;
++        const float value = (x[col] - mean) * inv_std;
++        if constexpr (do_multiply && do_add) {
++            dst[col] = value * mul[fastmodulo(col, mul_ncols_packed)] + add[fastmodulo(col, add_ncols_packed)];
++        } else if constexpr (do_multiply) {
++            dst[col] = value * mul[fastmodulo(col, mul_ncols_packed)];
++        } else {
++            dst[col] = value;
++        }
+     }
+ }
+ 
+@@ -283,11 +319,61 @@ static void norm_f32_cuda(
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+     if (ncols < 1024) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+-        norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 0, stream};
++        ggml_cuda_kernel_launch(norm_f32<WARP_SIZE, false>, launch_params,
++            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+     } else {
+         const dim3 block_dims(1024, 1, 1);
+-        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float2), stream};
++        ggml_cuda_kernel_launch(norm_f32<1024, false>, launch_params,
++            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++    }
++}
++
++static void norm_affine_f32_cuda(
++        const float * x, const float * mul, const float * add, float * dst,
++        const int ncols, const int nrows, const int nchannels, const int nsamples,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
++        const ggml_tensor * mul_src, const ggml_tensor * add_src, const float eps, cudaStream_t stream) {
++    const auto stride = [](const ggml_tensor * t, int dim) {
++        return int64_t(t->nb[dim] / ggml_element_size(t));
++    };
++    const auto packed = [](const ggml_tensor * t, int dim) {
++        return init_fastdiv_values((uint32_t) t->ne[dim]);
++    };
++
++    const dim3 blocks_num(nrows, nchannels, nsamples);
++    const dim3 block_dims(ncols < 1024 ? WARP_SIZE : 1024, 1, 1);
++    const size_t smem = ncols < 1024 ? 0 : 32 * sizeof(float2);
++
++#define NORM_AFFINE_ARGS \
++    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, \
++    mul, stride(mul_src, 1), stride(mul_src, 2), stride(mul_src, 3), \
++    packed(mul_src, 0), packed(mul_src, 1), packed(mul_src, 2), packed(mul_src, 3)
++
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, smem, stream};
++    if (add_src) {
++        if (ncols < 1024) {
++            ggml_cuda_kernel_launch(norm_f32<WARP_SIZE, true, true>, launch_params, NORM_AFFINE_ARGS,
++                add, stride(add_src, 1), stride(add_src, 2), stride(add_src, 3),
++                packed(add_src, 0), packed(add_src, 1), packed(add_src, 2), packed(add_src, 3));
++        } else {
++            ggml_cuda_kernel_launch(norm_f32<1024, true, true>, launch_params, NORM_AFFINE_ARGS,
++                add, stride(add_src, 1), stride(add_src, 2), stride(add_src, 3),
++                packed(add_src, 0), packed(add_src, 1), packed(add_src, 2), packed(add_src, 3));
++        }
++    } else if (ncols < 1024) {
++        ggml_cuda_kernel_launch(norm_f32<WARP_SIZE, true>, launch_params, NORM_AFFINE_ARGS,
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++    } else {
++        ggml_cuda_kernel_launch(norm_f32<1024, true>, launch_params, NORM_AFFINE_ARGS,
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+     }
++#undef NORM_AFFINE_ARGS
+ }
+ 
+ static void group_norm_f32_cuda(
+@@ -456,6 +542,37 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+ }
+ 
++void ggml_cuda_op_norm_fused(
++        ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * add) {
++    const ggml_tensor * src = norm->src[0];
++    const ggml_tensor * scale = mul->src[0] == norm ? mul->src[1] : mul->src[0];
++    const ggml_tensor * bias = nullptr;
++    if (add) {
++        bias = add->src[0] == mul ? add->src[1] : add->src[0];
++    }
++
++    GGML_ASSERT(src->type == GGML_TYPE_F32);
++    GGML_ASSERT(norm->type == GGML_TYPE_F32);
++    GGML_ASSERT(scale->type == GGML_TYPE_F32);
++    GGML_ASSERT(!bias || bias->type == GGML_TYPE_F32);
++
++    float eps;
++    memcpy(&eps, norm->op_params, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
++
++    const size_t ts = ggml_type_size(src->type);
++    GGML_ASSERT(src->nb[0] == ts);
++
++    norm_affine_f32_cuda(
++        (const float *) src->data,
++        (const float *) scale->data,
++        bias ? (const float *) bias->data : nullptr,
++        (float *) (add ? add->data : mul->data),
++        src->ne[0], src->ne[1], src->ne[2], src->ne[3],
++        src->nb[1] / ts, src->nb[2] / ts, src->nb[3] / ts,
++        scale, bias, eps, ctx.stream());
++}
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const float * src0_d = (const float *)src0->data;
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index a74f6376720a..3feb0747eb66 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -2,6 +2,9 @@
+ 
+ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++void ggml_cuda_op_norm_fused(
++    ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * add);
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/rwkv-fusion.cu b/ggml/src/ggml-cuda/rwkv-fusion.cu
+new file mode 100644
+index 000000000000..3f806c65bf2a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/rwkv-fusion.cu
+@@ -0,0 +1,50 @@
++#include "rwkv-fusion.cuh"
++
++#include <cstdint>
++#include <limits>
++
++static __global__ void k_key_adjust_fused_f32(
++        const float * __restrict__ k,
++        const float * __restrict__ a,
++        const float * __restrict__ k_a,
++        float * __restrict__ dst,
++        const int64_t ne0,
++        const int64_t total) {
++    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (idx >= total) {
++        return;
++    }
++
++    const float ka = k[idx] * k_a[idx % ne0];
++    dst[idx] = k[idx] + (a[idx] * ka - ka);
++}
++
++void ggml_cuda_op_key_adjust_fused(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * k,
++        const ggml_tensor * a,
++        const ggml_tensor * k_a,
++        ggml_tensor * dst) {
++    GGML_ASSERT(k->type   == GGML_TYPE_F32);
++    GGML_ASSERT(a->type   == GGML_TYPE_F32);
++    GGML_ASSERT(k_a->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_are_same_shape(k, a));
++    GGML_ASSERT(ggml_are_same_shape(k, dst));
++    GGML_ASSERT(k_a->ne[0] == dst->ne[0]);
++    GGML_ASSERT(ggml_nelements(k_a) == dst->ne[0]);
++    GGML_ASSERT(ggml_is_contiguous(k));
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_is_contiguous(k_a));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++
++    const int64_t total = ggml_nelements(dst);
++    const int block = 256;
++    const int64_t grid = (total + block - 1) / block;
++    GGML_ASSERT(grid <= std::numeric_limits<uint32_t>::max());
++
++    const ggml_cuda_kernel_launch_params launch_params(dim3((uint32_t) grid), block, 0, ctx.stream());
++    ggml_cuda_kernel_launch(k_key_adjust_fused_f32, launch_params,
++            (const float *) k->data, (const float *) a->data, (const float *) k_a->data,
++            (float *) dst->data, dst->ne[0], total);
++}
+diff --git a/ggml/src/ggml-cuda/rwkv-fusion.cuh b/ggml/src/ggml-cuda/rwkv-fusion.cuh
+new file mode 100644
+index 000000000000..bd14124645bd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/rwkv-fusion.cuh
+@@ -0,0 +1,8 @@
++#include "common.cuh"
++
++void ggml_cuda_op_key_adjust_fused(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * k,
++    const ggml_tensor * a,
++    const ggml_tensor * k_a,
++    ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a04a6b27a8c1..910ccf00e3bd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -966,6 +966,9 @@ struct vk_device_struct {
+     vk_pipeline pipeline_sub_norepeat[2][2][2];
+     vk_pipeline pipeline_mul[2][2][2];
+     vk_pipeline pipeline_mul_norepeat[2][2][2];
++    vk_pipeline pipeline_add_mul_f32;
++    vk_pipeline pipeline_lerp_f32;
++    vk_pipeline pipeline_key_adjust_f32;
+     vk_pipeline pipeline_div[2][2][2];
+     vk_pipeline pipeline_div_norepeat[2][2][2];
+     vk_pipeline pipeline_add_rms[2][2][2];
+@@ -999,6 +1002,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
+     vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
+     vk_pipeline pipeline_norm_f32;
++    vk_pipeline pipeline_norm_mul_add_f32;
+     vk_pipeline pipeline_group_norm_f32;
+     vk_pipeline pipeline_rms_norm_f32;
+     vk_pipeline pipeline_rms_norm_mul_f32;
+@@ -1100,6 +1104,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_pool2d_f32;
+     vk_pipeline pipeline_rwkv_wkv6_f32;
+     vk_pipeline pipeline_rwkv_wkv7_f32;
++    vk_pipeline pipeline_rwkv_wkv7_t1_f32;
+     vk_pipeline pipeline_gated_linear_attn_f32;
+     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
+     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
+@@ -1642,6 +1647,24 @@ struct vk_op_binary_push_constants {
+     float param1; float param2; int32_t param3;
+ };
+ 
++struct vk_op_lerp_push_constants {
++    uint32_t ne0;
++    uint32_t base_total;
++    uint32_t x_offset;
++    uint32_t c_offset;
++    uint32_t w_offset;
++    uint32_t d_offset;
++};
++
++struct vk_op_key_adjust_push_constants {
++    uint32_t ne0;
++    uint32_t total;
++    uint32_t k_offset;
++    uint32_t a_offset;
++    uint32_t ka_offset;
++    uint32_t d_offset;
++};
++
+ // Distinct type with the same layout so concat can overload tensor offset initialization.
+ struct vk_op_concat_push_constants : vk_op_binary_push_constants {};
+ static_assert(sizeof(vk_op_concat_push_constants) == sizeof(vk_op_binary_push_constants));
+@@ -1880,14 +1903,7 @@ struct vk_op_pool2d_push_constants {
+     int32_t p0; int32_t p1;
+ };
+ 
+-struct vk_op_rwkv_wkv6_push_constants {
+-    uint32_t B;
+-    uint32_t T;
+-    uint32_t C;
+-    uint32_t H;
+-};
+-
+-struct vk_op_rwkv_wkv7_push_constants {
++struct vk_op_rwkv_wkv_push_constants {
+     uint32_t B;
+     uint32_t T;
+     uint32_t C;
+@@ -5566,6 +5582,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_add_mul_f32, "add_mul_f32", add_mul_f32_len, add_mul_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_lerp_f32, "lerp_f32", lerp_f32_len, lerp_f32_data, "main", 4, sizeof(vk_op_lerp_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_key_adjust_f32, "key_adjust_f32", key_adjust_f32_len, key_adjust_f32_data, "main", 4, sizeof(vk_op_key_adjust_push_constants), {256, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+ 
+     for (auto &it : device->pipeline_fa_mask_opt) {
+@@ -5589,6 +5608,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_mul_add_f32_len, norm_mul_add_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+@@ -5940,9 +5960,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_pool1d_f32, "pool1d_f32", pool1d_f32_len, pool1d_f32_data, "main", 2, sizeof(vk_op_pool1d_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
+ 
+-    ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
+ 
+-    ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv7_f32, "rwkv_wkv7_f32", rwkv_wkv7_f32_len, rwkv_wkv7_f32_data, "main", 8, sizeof(vk_op_rwkv_wkv7_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv7_f32, "rwkv_wkv7_f32", rwkv_wkv7_f32_len, rwkv_wkv7_f32_data, "main", 8, sizeof(vk_op_rwkv_wkv_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
++    // Intel Windows fails RWKV_WKV7 T=1 correctness with this subgroup shader.
++    if (device->subgroup_arithmetic &&
++            device->driver_id != vk::DriverId::eIntelProprietaryWindows &&
++            device->subgroup_size <= 64 && 64 % device->subgroup_size == 0) {
++        const uint32_t rows_per_wg = 4;
++        ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv7_t1_f32, "rwkv_wkv7_t1_f32", rwkv_wkv7_t1_f32_len, rwkv_wkv7_t1_f32_data, "main", 8, sizeof(vk_op_rwkv_wkv_push_constants), {1, rows_per_wg, 1}, {device->subgroup_size, rows_per_wg}, 1, true, true, device->subgroup_size);
++    }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_gated_linear_attn_f32, "gated_linear_attn_f32", gated_linear_attn_f32_len, gated_linear_attn_f32_data, "main", 6, sizeof(vk_op_gated_linear_attn_push_constants), {1, 1, 1}, {}, 1);
+ 
+@@ -12760,6 +12787,128 @@ static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     });
+ }
+ 
++static void ggml_vk_add_mul(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * add = cgraph->nodes[node_idx];
++    ggml_tensor * dst = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * scale = dst->src[0] == add ? dst->src[1] : dst->src[0];
++    const ggml_tensor * src0 = add->src[0];
++    const ggml_tensor * src1 = add->src[1];
++
++    const uint32_t src0_type_size = ggml_type_size(src0->type);
++    const uint32_t src1_type_size = ggml_type_size(src1->type);
++    const uint32_t dst_type_size  = ggml_type_size(dst->type);
++
++    vk_op_binary_push_constants pc {
++        (uint32_t) ggml_nelements(dst),
++        (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2], (uint32_t) src0->ne[3], (uint32_t) src0->nb[0] / src0_type_size, (uint32_t) src0->nb[1] / src0_type_size, (uint32_t) src0->nb[2] / src0_type_size, (uint32_t) src0->nb[3] / src0_type_size,
++        (uint32_t) src1->ne[0], (uint32_t) src1->ne[1], (uint32_t) src1->ne[2], (uint32_t) src1->ne[3], (uint32_t) src1->nb[0] / src1_type_size, (uint32_t) src1->nb[1] / src1_type_size, (uint32_t) src1->nb[2] / src1_type_size, (uint32_t) src1->nb[3] / src1_type_size,
++        (uint32_t)  dst->ne[0], (uint32_t)  dst->ne[1], (uint32_t)  dst->ne[2], (uint32_t)  dst->ne[3], (uint32_t)  dst->nb[0] /  dst_type_size, (uint32_t)  dst->nb[1] /  dst_type_size, (uint32_t)  dst->nb[2] /  dst_type_size, (uint32_t)  dst->nb[3] /  dst_type_size,
++        0,
++        0.0f, 0.0f, 0,
++    };
++
++    init_pushconst_fastdiv(pc);
++    init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
++
++    vk_subbuffer src0_buf  = ggml_vk_tensor_subbuffer(ctx, src0, true);
++    vk_subbuffer src1_buf  = ggml_vk_tensor_subbuffer(ctx, src1, true);
++    vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst, true);
++    vk_subbuffer scale_buf = ggml_vk_tensor_subbuffer(ctx, scale);
++
++    std::array<uint32_t, 3> elements;
++    const uint32_t ne = (uint32_t) ggml_nelements(dst);
++    if (ne > 262144) {
++        elements = { 512, 512, CEIL_DIV(ne, 262144) };
++    } else if (ne > 512) {
++        elements = { 512, CEIL_DIV(ne, 512), 1 };
++    } else {
++        elements = { ne, 1, 1 };
++    }
++
++    vk_pipeline pipeline = ctx->device->pipeline_add_mul_f32;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf, scale_buf }, pc, elements);
++}
++
++static bool ggml_vk_should_fuse_lerp(
++        const ggml_backend_vk_context * ctx,
++        const ggml_tensor * sub,
++        const ggml_tensor * repeat,
++        const ggml_tensor * mul,
++        const ggml_tensor * add,
++        const ggml_tensor ** x_prev,
++        const ggml_tensor ** cur,
++        const ggml_tensor ** weight);
++
++static bool ggml_vk_should_fuse_key_adjust(
++        const ggml_backend_vk_context * ctx,
++        const ggml_tensor * ka,
++        const ggml_tensor * a_ka,
++        const ggml_tensor * delta,
++        const ggml_tensor * add,
++        const ggml_tensor ** k,
++        const ggml_tensor ** a,
++        const ggml_tensor ** k_a);
++
++static void ggml_vk_lerp(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * sub    = cgraph->nodes[node_idx];
++    const ggml_tensor * repeat = ctx->num_additional_fused_ops == 3 ? cgraph->nodes[node_idx + 1] : nullptr;
++    const ggml_tensor * mul    = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
++    ggml_tensor * dst          = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
++
++    const ggml_tensor * x_prev = nullptr;
++    const ggml_tensor * cur    = nullptr;
++    const ggml_tensor * weight = nullptr;
++    GGML_ASSERT(ggml_vk_should_fuse_lerp(ctx, sub, repeat, mul, dst, &x_prev, &cur, &weight));
++
++    vk_op_lerp_push_constants pc {
++        (uint32_t) dst->ne[0],
++        (uint32_t) ggml_nelements(x_prev),
++        get_misalign_bytes(ctx, x_prev) / (uint32_t) ggml_type_size(x_prev->type),
++        get_misalign_bytes(ctx, cur)    / (uint32_t) ggml_type_size(cur->type),
++        get_misalign_bytes(ctx, weight) / (uint32_t) ggml_type_size(weight->type),
++        get_misalign_bytes(ctx, dst)    / (uint32_t) ggml_type_size(dst->type),
++    };
++
++    vk_subbuffer x_prev_buf = ggml_vk_tensor_subbuffer(ctx, x_prev, true);
++    vk_subbuffer cur_buf    = ggml_vk_tensor_subbuffer(ctx, cur, true);
++    vk_subbuffer weight_buf = ggml_vk_tensor_subbuffer(ctx, weight, true);
++    vk_subbuffer dst_buf    = ggml_vk_tensor_subbuffer(ctx, dst, true);
++
++    const uint32_t n_mix = (uint32_t) (ggml_nelements(dst) / ggml_nelements(x_prev));
++    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_lerp_f32, 1);
++    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_lerp_f32,
++            { x_prev_buf, cur_buf, weight_buf, dst_buf }, pc, { pc.base_total, n_mix, 1 });
++}
++
++static void ggml_vk_key_adjust(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
++    const ggml_tensor * k   = nullptr;
++    const ggml_tensor * a   = nullptr;
++    const ggml_tensor * k_a = nullptr;
++    ggml_tensor * dst = cgraph->nodes[node_idx + 3];
++    GGML_ASSERT(ggml_vk_should_fuse_key_adjust(ctx,
++            cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2], dst,
++            &k, &a, &k_a));
++
++    vk_op_key_adjust_push_constants pc {
++        (uint32_t) dst->ne[0],
++        (uint32_t) ggml_nelements(dst),
++        get_misalign_bytes(ctx, k)   / (uint32_t) sizeof(float),
++        get_misalign_bytes(ctx, a)   / (uint32_t) sizeof(float),
++        get_misalign_bytes(ctx, k_a) / (uint32_t) sizeof(float),
++        get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
++    };
++
++    vk_subbuffer k_buf   = ggml_vk_tensor_subbuffer(ctx, k, true);
++    vk_subbuffer a_buf   = ggml_vk_tensor_subbuffer(ctx, a, true);
++    vk_subbuffer k_a_buf = ggml_vk_tensor_subbuffer(ctx, k_a, true);
++    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
++
++    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_key_adjust_f32, 1);
++    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_key_adjust_f32,
++            { k_buf, a_buf, k_a_buf, dst_buf }, pc, { pc.total, 1, 1 });
++}
++
+ static void ggml_vk_div(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     const uint32_t src0_type_size = ggml_type_size(src0->type);
+     const uint32_t src1_type_size = ggml_type_size(src1->type);
+@@ -12790,7 +12939,7 @@ static void ggml_vk_add_id(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     });
+ }
+ 
+-static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_rwkv_wkv6_push_constants&& pc, int version) {
++static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_rwkv_wkv_push_constants & pc, int version) {
+     GGML_ASSERT(version == 6 || version == 7);
+     int num_srcs = version == 6 ? 6 : 7;
+ 
+@@ -12849,21 +12998,52 @@ static void ggml_vk_rwkv_wkv6(ggml_backend_vk_context * ctx, vk_context& subctx,
+     );
+ }
+ 
++static bool ggml_vk_rwkv_wkv7_t1(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_rwkv_wkv_push_constants & pc) {
++    const uint32_t head_size = pc.H == 0 ? 0 : pc.C / pc.H;
++    if (pc.T != pc.B || head_size != 64 || ctx->device->pipeline_rwkv_wkv7_t1_f32 == nullptr) {
++        return false;
++    }
++
++    for (int i = 0; i < 7; i++) {
++        GGML_ASSERT(!ggml_is_quantized(dst->src[i]->type));
++    }
++
++    GGML_ASSERT(dst->buffer != nullptr);
++
++    vk_pipeline pipeline = ctx->device->pipeline_rwkv_wkv7_t1_f32;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
++    vk_subbuffer src_buf[7] = {};
++    for (int i = 0; i < 7; i++) {
++        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
++    }
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], dst_buf},
++        pc, {pc.B * pc.H, head_size, 1});
++
++    return true;
++}
++
+ static void ggml_vk_rwkv_wkv7(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const size_t seq_length = dst->src[0]->ne[2];
+     const size_t n_embed = dst->ne[0];
+     const size_t n_heads = dst->src[0]->ne[1];
+     const size_t n_seqs = dst->src[6]->ne[1];
++    const vk_op_rwkv_wkv_push_constants pc = {
++        (uint32_t)n_seqs,
++        (uint32_t)seq_length,
++        (uint32_t)n_embed,
++        (uint32_t)n_heads,
++    };
++
++    if (ggml_vk_rwkv_wkv7_t1(ctx, subctx, dst, pc)) {
++        return;
++    }
+ 
+     ggml_vk_op_f32_wkv(
+-        ctx, subctx, dst,
+-        {
+-            (uint32_t)n_seqs,
+-            (uint32_t)seq_length,
+-            (uint32_t)n_embed,
+-            (uint32_t)n_heads,
+-        },
+-        7
++        ctx, subctx, dst, pc, 7
+     );
+ }
+ 
+@@ -13407,6 +13587,46 @@ static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, std::move(p));
+ }
+ 
++static void ggml_vk_norm_mul_add(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
++    ggml_tensor * norm = cgraph->nodes[node_idx];
++    ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
++    ggml_tensor * add  = cgraph->nodes[node_idx + 2];
++
++    const ggml_tensor * src0 = norm->src[0];
++    const ggml_tensor * src1 = mul->src[0] == norm ? mul->src[1] : mul->src[0];
++    const ggml_tensor * src2 = add->src[0] == mul  ? add->src[1] : add->src[0];
++    ggml_tensor * dst = add;
++
++    const uint32_t src0_type_size = ggml_type_size(src0->type);
++    const uint32_t src1_type_size = ggml_type_size(src1->type);
++    const uint32_t dst_type_size  = ggml_type_size(dst->type);
++
++    float * op_params = (float *) norm->op_params;
++
++    vk_op_binary_push_constants pc {
++        (uint32_t) ggml_nelements(src0),
++        (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2], (uint32_t) src0->ne[3], (uint32_t) src0->nb[0] / src0_type_size, (uint32_t) src0->nb[1] / src0_type_size, (uint32_t) src0->nb[2] / src0_type_size, (uint32_t) src0->nb[3] / src0_type_size,
++        (uint32_t) src1->ne[0], (uint32_t) src1->ne[1], (uint32_t) src1->ne[2], (uint32_t) src1->ne[3], (uint32_t) src1->nb[0] / src1_type_size, (uint32_t) src1->nb[1] / src1_type_size, (uint32_t) src1->nb[2] / src1_type_size, (uint32_t) src1->nb[3] / src1_type_size,
++        (uint32_t)  dst->ne[0], (uint32_t)  dst->ne[1], (uint32_t)  dst->ne[2], (uint32_t)  dst->ne[3], (uint32_t)  dst->nb[0] /  dst_type_size, (uint32_t)  dst->nb[1] /  dst_type_size, (uint32_t)  dst->nb[2] /  dst_type_size, (uint32_t)  dst->nb[3] /  dst_type_size,
++        0,
++        op_params[0], 0.0f, 0,
++    };
++
++    init_pushconst_fastdiv(pc);
++    init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
++
++    vk_pipeline pipeline = ctx->device->pipeline_norm_mul_add_f32;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
++    vk_subbuffer src1_buf = ggml_vk_tensor_subbuffer(ctx, src1, true);
++    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst,  true);
++    vk_subbuffer src2_buf = ggml_vk_tensor_subbuffer(ctx, src2);
++
++    std::array<uint32_t, 3> elements = { (uint32_t) src0->ne[1], (uint32_t) src0->ne[2], (uint32_t) src0->ne[3] };
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf, src2_buf }, pc, elements);
++}
++
+ static void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+     const int * int_op_params = (const int *)dst->op_params;
+     const float * float_op_params = (const float *)dst->op_params;
+@@ -15829,7 +16049,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         break;
+     case GGML_OP_ADD:
+         if (ctx->num_additional_fused_ops) {
+-            ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
++            if (cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
++                ggml_vk_add_mul(ctx, compute_ctx, cgraph, node_idx);
++            } else {
++                ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
++            }
+         } else {
+             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
+         }
+@@ -15838,12 +16062,23 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         ggml_vk_out_prod(ctx, compute_ctx, src0, src1, node);
+         break;
+     case GGML_OP_SUB:
+-        ggml_vk_sub(ctx, compute_ctx, src0, src1, node);
++        if (ctx->num_additional_fused_ops) {
++            ggml_vk_lerp(ctx, compute_ctx, cgraph, node_idx);
++        } else {
++            ggml_vk_sub(ctx, compute_ctx, src0, src1, node);
++        }
+ 
+         break;
+     case GGML_OP_MUL:
+         if (ctx->num_additional_fused_ops) {
+-            ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
++            if (ctx->num_additional_fused_ops == 3 &&
++                cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL &&
++                cgraph->nodes[node_idx + 2]->op == GGML_OP_SUB &&
++                cgraph->nodes[node_idx + 3]->op == GGML_OP_ADD) {
++                ggml_vk_key_adjust(ctx, compute_ctx, cgraph, node_idx);
++            } else {
++                ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
++            }
+         } else {
+             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
+         }
+@@ -15940,7 +16175,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+     case GGML_OP_NORM:
+-        ggml_vk_norm(ctx, compute_ctx, src0, node);
++        if (ctx->num_additional_fused_ops == 2) {
++            ggml_vk_norm_mul_add(ctx, compute_ctx, cgraph, node_idx);
++        } else {
++            ggml_vk_norm(ctx, compute_ctx, src0, node);
++        }
+ 
+         break;
+     case GGML_OP_GROUP_NORM:
+@@ -16912,12 +17151,233 @@ static bool ggml_vk_is_empty(ggml_tensor * node) {
+     return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
+ }
+ 
++static bool ggml_vk_should_fuse_add_mul(const ggml_backend_vk_context * ctx, const ggml_tensor * add, const ggml_tensor * mul) {
++    if (add->op != GGML_OP_ADD || mul->op != GGML_OP_MUL ||
++        (mul->src[0] != add && mul->src[1] != add)) {
++        return false;
++    }
++
++    const ggml_tensor * scale = mul->src[0] == add ? mul->src[1] : mul->src[0];
++
++    if (add->src[0]->type != GGML_TYPE_F32 ||
++        add->src[1]->type != GGML_TYPE_F32 ||
++        add->type         != GGML_TYPE_F32 ||
++        scale->type       != GGML_TYPE_F32 ||
++        mul->type         != GGML_TYPE_F32) {
++        return false;
++    }
++
++    if (!ggml_are_same_shape(add->src[0], mul) ||
++        !ggml_are_same_shape(add->src[1], mul) ||
++        !ggml_are_same_shape(scale, mul)       ||
++        !ggml_are_same_stride(scale, mul)) {
++        return false;
++    }
++
++    // The shader indexes scale with the destination layout and base offset.
++    return get_misalign_bytes(ctx, scale) == 0 && get_misalign_bytes(ctx, mul) == 0;
++}
++
++static bool ggml_vk_should_fuse_lerp(
++        const ggml_backend_vk_context * ctx,
++        const ggml_tensor * sub,
++        const ggml_tensor * repeat,
++        const ggml_tensor * mul,
++        const ggml_tensor * add,
++        const ggml_tensor ** x_prev,
++        const ggml_tensor ** cur,
++        const ggml_tensor ** weight) {
++    if (sub->op != GGML_OP_SUB || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
++        return false;
++    }
++
++    const ggml_tensor * sx = sub;
++    if (repeat) {
++        if (repeat->op != GGML_OP_REPEAT || repeat->src[0] != sub) {
++            return false;
++        }
++        sx = repeat;
++    }
++
++    const ggml_tensor * w = nullptr;
++    if (mul->src[0] == sx) {
++        w = mul->src[1];
++    } else if (mul->src[1] == sx) {
++        w = mul->src[0];
++    } else {
++        return false;
++    }
++
++    const ggml_tensor * add_cur = nullptr;
++    if (add->src[0] == mul) {
++        add_cur = add->src[1];
++    } else if (add->src[1] == mul) {
++        add_cur = add->src[0];
++    } else {
++        return false;
++    }
++
++    const ggml_tensor * xp = sub->src[0];
++    const ggml_tensor * c  = sub->src[1];
++    if (add_cur != c ||
++        xp->type  != GGML_TYPE_F32 ||
++        c->type   != GGML_TYPE_F32 ||
++        w->type   != GGML_TYPE_F32 ||
++        sub->type != GGML_TYPE_F32 ||
++        mul->type != GGML_TYPE_F32 ||
++        (repeat && repeat->type != GGML_TYPE_F32) ||
++        add->type != GGML_TYPE_F32) {
++        return false;
++    }
++
++    if (!ggml_is_contiguous(xp) ||
++        !ggml_is_contiguous(c)  ||
++        !ggml_is_contiguous(w)  ||
++        !ggml_is_contiguous(add)) {
++        return false;
++    }
++
++    const int64_t base_total = ggml_nelements(xp);
++    const int64_t total      = ggml_nelements(add);
++    if (!ggml_are_same_shape(xp, c) ||
++        base_total <= 0 || total % base_total != 0 ||
++        add->ne[0] != xp->ne[0] ||
++        add->ne[1] != xp->ne[1] ||
++        add->ne[2] != xp->ne[2]) {
++        return false;
++    }
++
++    const int64_t n_mix = total / base_total;
++    if (w->ne[0] != add->ne[0] ||
++        w->ne[1] != 1 ||
++        w->ne[2] != 1 ||
++        w->ne[3] != n_mix ||
++        ggml_nelements(w) != add->ne[0] * n_mix ||
++        add->ne[0] > UINT32_MAX ||
++        base_total > UINT32_MAX ||
++        n_mix > UINT32_MAX) {
++        return false;
++    }
++
++    if (get_misalign_bytes(ctx, xp) % sizeof(float) != 0 ||
++        get_misalign_bytes(ctx, c)  % sizeof(float) != 0 ||
++        get_misalign_bytes(ctx, w)  % sizeof(float) != 0 ||
++        get_misalign_bytes(ctx, add) % sizeof(float) != 0) {
++        return false;
++    }
++
++    *x_prev = xp;
++    *cur    = c;
++    *weight = w;
++    return true;
++}
++
++static bool ggml_vk_should_fuse_key_adjust(
++        const ggml_backend_vk_context * ctx,
++        const ggml_tensor * ka,
++        const ggml_tensor * a_ka,
++        const ggml_tensor * delta,
++        const ggml_tensor * add,
++        const ggml_tensor ** k,
++        const ggml_tensor ** a,
++        const ggml_tensor ** k_a) {
++    if (delta->src[0] != a_ka || delta->src[1] != ka) {
++        return false;
++    }
++
++    const ggml_tensor * av = a_ka->src[0] == ka ? a_ka->src[1] :
++                              a_ka->src[1] == ka ? a_ka->src[0] : nullptr;
++    const ggml_tensor * kv = add->src[0] == delta ? add->src[1] :
++                              add->src[1] == delta ? add->src[0] : nullptr;
++    if (!av || !kv) {
++        return false;
++    }
++
++    const ggml_tensor * kav = ka->src[0] == kv ? ka->src[1] :
++                               ka->src[1] == kv ? ka->src[0] : nullptr;
++    if (!kav ||
++        kv->type    != GGML_TYPE_F32 ||
++        av->type    != GGML_TYPE_F32 ||
++        kav->type   != GGML_TYPE_F32 ||
++        ka->type    != GGML_TYPE_F32 ||
++        a_ka->type  != GGML_TYPE_F32 ||
++        delta->type != GGML_TYPE_F32 ||
++        add->type   != GGML_TYPE_F32) {
++        return false;
++    }
++
++    if (!ggml_are_same_shape(kv, av) ||
++        !ggml_are_same_shape(kv, add) ||
++        kav->ne[0] != add->ne[0] ||
++        ggml_nelements(kav) != add->ne[0] ||
++        ggml_nelements(add) > UINT32_MAX) {
++        return false;
++    }
++
++    if (!ggml_is_contiguous(kv) ||
++        !ggml_is_contiguous(av) ||
++        !ggml_is_contiguous(kav) ||
++        !ggml_is_contiguous(add)) {
++        return false;
++    }
++
++    if (get_misalign_bytes(ctx, kv)  % sizeof(float) != 0 ||
++        get_misalign_bytes(ctx, av)  % sizeof(float) != 0 ||
++        get_misalign_bytes(ctx, kav) % sizeof(float) != 0 ||
++        get_misalign_bytes(ctx, add) % sizeof(float) != 0) {
++        return false;
++    }
++
++    *k   = kv;
++    *a   = av;
++    *k_a = kav;
++    return true;
++}
++
+ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
+     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+         return false;
+     }
+ 
+-    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
++    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
++        const ggml_tensor * norm = cgraph->nodes[node_idx];
++        const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
++        const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
++        const ggml_tensor * w    = mul->src[0] == norm ? mul->src[1] : mul->src[0];
++        const ggml_tensor * b    = add->src[0] == mul  ? add->src[1] : add->src[0];
++
++        if (norm->src[0]->type != GGML_TYPE_F32 ||
++            norm->type         != GGML_TYPE_F32 ||
++            mul->type          != GGML_TYPE_F32 ||
++            add->type          != GGML_TYPE_F32 ||
++            w->type            != GGML_TYPE_F32 ||
++            b->type            != GGML_TYPE_F32) {
++            return false;
++        }
++
++        if (!ggml_are_same_shape(w, b) ||
++            !ggml_are_same_stride(w, b) ||
++            w->ne[0] != norm->ne[0] ||
++            !ggml_are_same_shape(norm, add)) {
++            return false;
++        }
++
++        if (!ggml_is_contiguous_rows(norm->src[0]) ||
++            !ggml_is_contiguous_rows(w) ||
++            !ggml_is_contiguous_rows(b) ||
++            !ggml_is_contiguous_rows(add)) {
++            return false;
++        }
++
++        // The shader reuses the scale tensor's shape, stride, and base offset for the bias tensor.
++        if (get_misalign_bytes(ctx, w) != 0 || get_misalign_bytes(ctx, b) != 0) {
++            return false;
++        }
++    } else if (ops.size() == 2 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_MUL) {
++        if (!ggml_vk_should_fuse_add_mul(ctx, cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1])) {
++            return false;
++        }
++    } else if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+         // additional constraints specific to this fusion
+         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+         const ggml_tensor *mul = cgraph->nodes[node_idx + 1];
+@@ -17732,6 +18192,48 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 fusion_string = "MUL_MAT_ID_MUL";
+                 op_srcs_fused_elementwise[0] = false;
+                 op_srcs_fused_elementwise[1] = true;
++            } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_ADD }, { i + 3 })) {
++                const ggml_tensor * k   = nullptr;
++                const ggml_tensor * a   = nullptr;
++                const ggml_tensor * k_a = nullptr;
++                if (ggml_vk_should_fuse_key_adjust(ctx,
++                            cgraph->nodes[i], cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
++                            &k, &a, &k_a)) {
++                    ctx->num_additional_fused_ops = 3;
++                    fusion_string = "KEY_ADJUST";
++                    std::fill_n(op_srcs_fused_elementwise, 4, true);
++                }
++            } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SUB, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, { i + 3 })) {
++                const ggml_tensor * x_prev = nullptr;
++                const ggml_tensor * cur    = nullptr;
++                const ggml_tensor * weight = nullptr;
++                if (ggml_vk_should_fuse_lerp(ctx, cgraph->nodes[i], cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
++                                             &x_prev, &cur, &weight)) {
++                    ctx->num_additional_fused_ops = 3;
++                    fusion_string = "LERP";
++                    std::fill_n(op_srcs_fused_elementwise, 4, true);
++                }
++            } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
++                const ggml_tensor * x_prev = nullptr;
++                const ggml_tensor * cur    = nullptr;
++                const ggml_tensor * weight = nullptr;
++                if (ggml_vk_should_fuse_lerp(ctx, cgraph->nodes[i], nullptr, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
++                                             &x_prev, &cur, &weight)) {
++                    ctx->num_additional_fused_ops = 2;
++                    fusion_string = "LERP";
++                    std::fill_n(op_srcs_fused_elementwise, 3, true);
++                }
++            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
++                ctx->num_additional_fused_ops = 2;
++                fusion_string = "NORM_MUL_ADD";
++                op_srcs_fused_elementwise[0] = true;
++                op_srcs_fused_elementwise[1] = true;
++                op_srcs_fused_elementwise[2] = true;
++            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_ADD, GGML_OP_MUL })) {
++                ctx->num_additional_fused_ops = 1;
++                fusion_string = "ADD_MUL";
++                op_srcs_fused_elementwise[0] = true;
++                op_srcs_fused_elementwise[1] = true;
+             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
+                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
+                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
+@@ -18108,6 +18610,21 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+         if (keep_pattern(topk_qsa_pattern)) {
+             continue;
+         }
++        if (keep_pattern({ GGML_OP_MUL, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_ADD })) {
++            continue;
++        }
++        if (keep_pattern({ GGML_OP_SUB, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD })) {
++            continue;
++        }
++        if (keep_pattern({ GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD })) {
++            continue;
++        }
++        if (keep_pattern({ GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
++            continue;
++        }
++        if (keep_pattern({ GGML_OP_ADD, GGML_OP_MUL })) {
++            continue;
++        }
+ 
+         // First, grab the next unused node.
+         current_set.push_back(first_unused);
+@@ -18142,13 +18659,21 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+                 match_pattern(topk_moe_early_softmax, j) ||
+                 match_pattern(topk_moe_late_softmax, j) ||
+                 match_pattern(snake_pattern, j) ||
+-                in_qsa_pattern(j)) {
++                in_qsa_pattern(j) ||
++                match_pattern({ GGML_OP_MUL, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_ADD }, j) ||
++                match_pattern({ GGML_OP_SUB, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, j) ||
++                match_pattern({ GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD }, j) ||
++                match_pattern({ GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, j) ||
++                match_pattern({ GGML_OP_ADD, GGML_OP_MUL }, j)) {
+                 continue;
+             }
+             bool ok = true;
+             for (int c = first_unused; c < j; ++c) {
+                 if (!used[c] &&
+                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
++                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
++                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_ADD) &&
++                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_MUL) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/add_mul.comp b/ggml/src/ggml-vulkan/vulkan-shaders/add_mul.comp
+new file mode 100644
+index 000000000000..0ae15b306946
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/add_mul.comp
+@@ -0,0 +1,34 @@
++#version 450
++
++#include "types.glsl"
++#include "generic_binary_head.glsl"
++
++const uint num_threads = 256;
++
++layout(binding = 3) readonly buffer C { B_TYPE data_c[]; };
++
++layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
++
++void main() {
++    uint idx = get_idx();
++
++    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation.
++    const uint num_iter = 2;
++
++    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
++        if (idx >= p.ne) {
++            continue;
++        }
++
++        uint i00, i01, i02, i03;
++        get_indices(idx, i00, i01, i02, i03);
++
++        const uint d_idx = get_doffset() + dst_idx(i00, i01, i02, i03);
++        const FLOAT_TYPE sum =
++            FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) +
++            FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
++        data_d[d_idx] = D_TYPE(sum * FLOAT_TYPE(data_c[d_idx]));
++
++        idx += num_threads;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/key_adjust.comp b/ggml/src/ggml-vulkan/vulkan-shaders/key_adjust.comp
+new file mode 100644
+index 000000000000..64b679edd928
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/key_adjust.comp
+@@ -0,0 +1,27 @@
++#version 450
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout(push_constant) uniform Parameters {
++    uint ne0;
++    uint total;
++    uint k_offset;
++    uint a_offset;
++    uint ka_offset;
++    uint d_offset;
++};
++
++layout(binding = 0) readonly buffer KBuf { float k[]; };
++layout(binding = 1) readonly buffer ABuf { float a[]; };
++layout(binding = 2) readonly buffer KABuf { float k_a[]; };
++layout(binding = 3) buffer DstBuf { float dst[]; };
++
++void main() {
++    const uint idx = gl_GlobalInvocationID.x;
++    if (idx >= total) {
++        return;
++    }
++
++    const float ka = k[k_offset + idx] * k_a[ka_offset + idx % ne0];
++    dst[d_offset + idx] = k[k_offset + idx] + (a[a_offset + idx] * ka - ka);
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/lerp.comp b/ggml/src/ggml-vulkan/vulkan-shaders/lerp.comp
+new file mode 100644
+index 000000000000..fb52880527f0
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/lerp.comp
+@@ -0,0 +1,33 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout(push_constant) uniform Parameters {
++    uint ne0;
++    uint base_total;
++    uint x_offset;
++    uint c_offset;
++    uint w_offset;
++    uint d_offset;
++};
++
++layout(binding = 0) readonly buffer XPrevBuf { A_TYPE x_prev[]; };
++layout(binding = 1) readonly buffer CurBuf { A_TYPE cur[]; };
++layout(binding = 2) readonly buffer WeightBuf { A_TYPE weight[]; };
++layout(binding = 3) buffer DstBuf { D_TYPE dst[]; };
++
++void main() {
++    const uint ibase = gl_GlobalInvocationID.x;
++    if (ibase >= base_total) {
++        return;
++    }
++
++    const uint imix = gl_GlobalInvocationID.y;
++    const uint i0 = ibase % ne0;
++    const A_TYPE c = cur[c_offset + ibase];
++
++    dst[d_offset + imix * base_total + ibase] =
++        D_TYPE(c + (x_prev[x_offset + ibase] - c) * weight[w_offset + imix * ne0 + i0]);
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/norm_mul_add.comp b/ggml/src/ggml-vulkan/vulkan-shaders/norm_mul_add.comp
+new file mode 100644
+index 000000000000..de7f867e5a4d
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/norm_mul_add.comp
+@@ -0,0 +1,96 @@
++#version 450
++
++#include "generic_binary_head.glsl"
++#include "types.glsl"
++
++#extension GL_EXT_control_flow_attributes : enable
++#define BLOCK_SIZE 512
++
++layout(binding = 3) readonly buffer C { B_TYPE data_c[]; };
++
++layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++
++shared vec2 sum[BLOCK_SIZE];
++
++void norm_mul_add(uint num_iters) {
++    const uint ncols   = p.ne00;
++    const uint row     = gl_WorkGroupID.x;
++    const uint channel = gl_WorkGroupID.y;
++    const uint samp    = gl_WorkGroupID.z;
++    const uint tid     = gl_LocalInvocationID.x;
++
++    const uint a_base = get_aoffset() + src0_idx(0, row, channel, samp);
++    const uint b_base = get_boffset() + src1_idx(0, row, channel, samp);
++    const uint d_base = get_doffset() + dst_idx(0, row, channel, samp);
++
++    vec2 sum_tid = vec2(0.0f, 0.0f);
++
++    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
++        if (col < ncols) {
++            const float xi = float(data_a[a_base + col*p.nb00]);
++            sum_tid.x += xi;
++            sum_tid.y += xi * xi;
++        }
++    }
++
++    sum[tid] = sum_tid;
++    barrier();
++    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sum[tid] += sum[tid + s];
++        }
++        barrier();
++    }
++
++    const float mean    = sum[0].x / float(ncols);
++    const float var     = sum[0].y / float(ncols) - mean * mean;
++    const float inv_std = inversesqrt(var + p.param1);
++
++    if (ncols > p.ne10) {
++        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
++            if (col >= ncols) {
++                continue;
++            }
++            const uint b_col = fastmod(col, p.ne10);
++            const float xi = float(data_a[a_base + col*p.nb00]);
++            const float w  = float(data_b[b_base + b_col*p.nb10]);
++            const float b  = float(data_c[b_base + b_col*p.nb10]);
++            data_d[d_base + col*p.nb20] = D_TYPE((xi - mean) * inv_std * w + b);
++        }
++    } else {
++        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
++            if (col >= ncols) {
++                continue;
++            }
++            const float xi = float(data_a[a_base + col*p.nb00]);
++            const float w  = float(data_b[b_base + col*p.nb10]);
++            const float b  = float(data_c[b_base + col*p.nb10]);
++            data_d[d_base + col*p.nb20] = D_TYPE((xi - mean) * inv_std * w + b);
++        }
++    }
++}
++
++void main() {
++    uint num_blocks = (p.ne00 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    if (num_blocks > 32) {
++        norm_mul_add(num_blocks);
++    } else if (num_blocks > 16) {
++        norm_mul_add(32);
++    } else if (num_blocks > 12) {
++        norm_mul_add(16);
++    } else if (num_blocks > 10) {
++        norm_mul_add(12);
++    } else if (num_blocks > 8) {
++        norm_mul_add(10);
++    } else if (num_blocks > 4) {
++        norm_mul_add(8);
++    } else if (num_blocks == 4) {
++        norm_mul_add(4);
++    } else if (num_blocks == 3) {
++        norm_mul_add(3);
++    } else if (num_blocks == 2) {
++        norm_mul_add(2);
++    } else if (num_blocks == 1) {
++        norm_mul_add(1);
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 27ff68c10d5b..80ac6fd2ce45 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -803,6 +803,7 @@ void process_shaders() {
+ 
+     // Norms
+     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
++    string_to_spv("norm_mul_add_f32", "norm_mul_add.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+@@ -871,6 +872,9 @@ void process_shaders() {
+     string_to_spv("sub_f32", "sub.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+ 
+     string_to_spv("acc_f32", "acc.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
++    string_to_spv("add_mul_f32", "add_mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
++    string_to_spv("lerp_f32", "lerp.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
++    string_to_spv("key_adjust_f32", "key_adjust.comp", {});
+ 
+     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
+     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
+@@ -1080,6 +1084,7 @@ void process_shaders() {
+     string_to_spv("lightning_indexer_subgroup_f32", "lightning_indexer.comp", merge_maps(li_dict, {{"USE_SUBGROUP_ADD", "1"}}));
+ 
+     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
++    string_to_spv("rwkv_wkv7_t1_f32", "wkv7_t1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+ 
+     string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));
+     string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/wkv7_t1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/wkv7_t1.comp
+new file mode 100644
+index 000000000000..a8513da6ba8a
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/wkv7_t1.comp
+@@ -0,0 +1,96 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++
++layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
++layout(constant_id = 1) const uint ROWS_PER_WG = 4;
++
++const uint HEAD_SIZE = 64;
++const uint ROWS_PER_LANE = HEAD_SIZE / SUBGROUP_SIZE;
++
++layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
++
++layout(push_constant) uniform Parameters {
++    uint B;
++    uint T;
++    uint C;
++    uint H;
++};
++
++layout(binding = 0) readonly buffer RBuf { A_TYPE r[]; };
++layout(binding = 1) readonly buffer WBuf { A_TYPE w[]; };
++layout(binding = 2) readonly buffer KBuf { A_TYPE k[]; };
++layout(binding = 3) readonly buffer VBuf { A_TYPE v[]; };
++layout(binding = 4) readonly buffer ABuf { A_TYPE a[]; };
++layout(binding = 5) readonly buffer BBuf { A_TYPE b[]; };
++layout(binding = 6) readonly buffer StateBuf { A_TYPE state_in[]; };
++layout(binding = 7) buffer DstBuf { A_TYPE dst[]; };
++
++shared A_TYPE _r[HEAD_SIZE], _w[HEAD_SIZE], _k[HEAD_SIZE], _a[HEAD_SIZE], _b[HEAD_SIZE];
++
++void main() {
++    const uint batch_id = gl_WorkGroupID.x / H;
++    const uint head_id = gl_WorkGroupID.x % H;
++    const uint row = gl_WorkGroupID.y * ROWS_PER_WG + gl_LocalInvocationID.y;
++    const uint lane = gl_SubgroupInvocationID;
++
++    if (batch_id >= B || head_id >= H || row >= HEAD_SIZE) {
++        return;
++    }
++
++    const uint state_size = C * HEAD_SIZE;
++    const uint head_off = head_id * HEAD_SIZE;
++    const uint token_base = batch_id * C + head_off;
++
++    if (gl_LocalInvocationID.y == 0) {
++        [[unroll]] for (uint r_i = 0; r_i < ROWS_PER_LANE; r_i++) {
++            const uint i = r_i * SUBGROUP_SIZE + lane;
++            const uint t = token_base + i;
++            _r[i] = r[t];
++            _w[i] = w[t];
++            _k[i] = k[t];
++            _a[i] = a[t];
++            _b[i] = b[t];
++        }
++    }
++    barrier();
++
++    A_TYPE s_shard[ROWS_PER_LANE];
++    [[unroll]] for (uint r_i = 0; r_i < ROWS_PER_LANE; r_i++) {
++        const uint i = r_i * SUBGROUP_SIZE + lane;
++        s_shard[r_i] = state_in[batch_id * state_size + head_id * HEAD_SIZE * HEAD_SIZE + row * HEAD_SIZE + i];
++    }
++
++    A_TYPE sa_partial = 0.0;
++    [[unroll]] for (uint r_i = 0; r_i < ROWS_PER_LANE; r_i++) {
++        const uint i = r_i * SUBGROUP_SIZE + lane;
++        sa_partial += s_shard[r_i] * _a[i];
++    }
++
++    const A_TYPE sa = subgroupAdd(sa_partial);
++
++    const uint t_out = token_base + row;
++    const A_TYPE v_val = v[t_out];
++    A_TYPE y_partial = 0.0;
++
++    [[unroll]] for (uint r_i = 0; r_i < ROWS_PER_LANE; r_i++) {
++        const uint i = r_i * SUBGROUP_SIZE + lane;
++        A_TYPE s = s_shard[r_i];
++        s = s * _w[i] + _k[i] * v_val + sa * _b[i];
++        s_shard[r_i] = s;
++        y_partial += _r[i] * s;
++    }
++
++    const A_TYPE y = subgroupAdd(y_partial);
++
++    if (lane == 0) {
++        dst[t_out] = y;
++    }
++
++    [[unroll]] for (uint r_i = 0; r_i < ROWS_PER_LANE; r_i++) {
++        const uint i = r_i * SUBGROUP_SIZE + lane;
++        dst[T * C + batch_id * state_size + head_id * HEAD_SIZE * HEAD_SIZE + row * HEAD_SIZE + i] = s_shard[r_i];
++    }
++}
+diff --git a/src/models/rwkv7-base.cpp b/src/models/rwkv7-base.cpp
+index 7fcab77745c7..592c5e43a895 100644
+--- a/src/models/rwkv7-base.cpp
++++ b/src/models/rwkv7-base.cpp
+@@ -129,7 +129,7 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
+     cur = ggml_add(ctx0, cur, ggml_reshape_2d(ctx0, ggml_mul(ctx0, v, rk), n_embd, n_tokens));
+ 
+     if (has_gating) {
+-        cur = ggml_mul(ctx0, cur, g);
++        cur = ggml_mul(ctx0, g, cur);
+     }
+     cur = build_lora_mm(layer.time_mix_output, cur);
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index eff63575f283..f0f25f041b2e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3394,6 +3394,132 @@ struct test_scale : public test_case {
+     }
+ };
+ 
++// GGML_OP_ADD + GGML_OP_MUL
++struct test_add_mul : public test_case {
++    const ggml_type type;
++    const std::array<int64_t, 4> ne;
++    const bool scale_first;
++    const bool view_scale;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "ADD_MUL";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR4(type, ne, scale_first, view_scale);
++    }
++
++    test_add_mul(
++            ggml_type type = GGML_TYPE_F32,
++            std::array<int64_t, 4> ne = {128, 2, 1, 1},
++            bool scale_first = false,
++            bool view_scale = false)
++        : type(type), ne(ne), scale_first(scale_first), view_scale(view_scale) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
++        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
++        ggml_tensor * scale = ggml_new_tensor(ctx, type, 4, ne.data());
++        ggml_set_param(a);
++        ggml_set_param(b);
++        ggml_set_param(scale);
++
++        if (view_scale) {
++            scale = ggml_reshape_4d(ctx, scale, ne[0], ne[1], ne[2], ne[3]);
++        }
++
++        ggml_tensor * add = ggml_add(ctx, a, b);
++        ggml_tensor * out = scale_first ? ggml_mul(ctx, scale, add) : ggml_mul(ctx, add, scale);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// GGML_OP_SUB + optional GGML_OP_REPEAT + GGML_OP_MUL + GGML_OP_ADD
++struct test_lerp_fusion : public test_case {
++    const std::array<int64_t, 4> ne;
++    const int64_t n_mix;
++    const bool use_repeat;
++    const bool scale_first;
++    const bool add_cur_first;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "LERP";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR5(ne, n_mix, use_repeat, scale_first, add_cur_first);
++    }
++
++    test_lerp_fusion(
++            std::array<int64_t, 4> ne,
++            int64_t n_mix,
++            bool use_repeat,
++            bool scale_first,
++            bool add_cur_first)
++        : ne(ne), n_mix(n_mix), use_repeat(use_repeat), scale_first(scale_first), add_cur_first(add_cur_first) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x_prev = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_tensor * cur    = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_tensor * weight = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], 1, 1, n_mix);
++        ggml_set_param(x_prev);
++        ggml_set_param(cur);
++        ggml_set_param(weight);
++
++        ggml_tensor * sx = ggml_sub(ctx, x_prev, cur);
++        if (use_repeat) {
++            ggml_tensor * shape = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], n_mix);
++            sx = ggml_repeat(ctx, sx, shape);
++        }
++
++        ggml_tensor * scaled = scale_first ? ggml_mul(ctx, weight, sx) : ggml_mul(ctx, sx, weight);
++        ggml_tensor * out = add_cur_first ? ggml_add(ctx, cur, scaled) : ggml_add(ctx, scaled, cur);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// GGML_OP_MUL + GGML_OP_MUL + GGML_OP_SUB + GGML_OP_ADD
++struct test_key_adjust_fusion : public test_case {
++    const std::array<int64_t, 4> ne;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "KEY_ADJUST";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR1(ne);
++    }
++
++    test_key_adjust_fusion(std::array<int64_t, 4> ne) : ne(ne) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * k   = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_tensor * a   = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_tensor * k_a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
++        ggml_set_param(k);
++        ggml_set_param(a);
++        ggml_set_param(k_a);
++
++        ggml_tensor * ka   = ggml_mul(ctx, k, k_a);
++        ggml_tensor * a_ka = ggml_mul(ctx, a, ka);
++        ggml_tensor * delta = ggml_sub(ctx, a_ka, ka);
++        ggml_tensor * out = ggml_add(ctx, k, delta);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_SCALE + GGML_UNARY_OP_TANH + GGML_OP_SCALE
+ struct test_softcap : public test_case {
+     const ggml_type type;
+@@ -9271,6 +9397,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
+     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
+     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
++    for (bool scale_first : { false, true }) {
++        for (bool view_scale : { false, true }) {
++            test_cases.emplace_back(new test_add_mul(GGML_TYPE_F32, { 64, 5, 4, 3 }, scale_first, view_scale));
++            test_cases.emplace_back(new test_add_mul(GGML_TYPE_F32, { 1025, 2, 1, 1 }, scale_first, view_scale));
++        }
++    }
++    test_cases.emplace_back(new test_lerp_fusion({ 64, 5, 4, 1 }, 1, false, false, false));
++    test_cases.emplace_back(new test_lerp_fusion({ 64, 5, 4, 1 }, 1, false, false, true));
++    test_cases.emplace_back(new test_lerp_fusion({ 65, 1, 1, 1 }, 1, false, true, false));
++    test_cases.emplace_back(new test_lerp_fusion({ 65, 1, 1, 1 }, 1, false, true, true));
++    test_cases.emplace_back(new test_lerp_fusion({ 65, 2, 3, 1 }, 6, true, false, false));
++    test_cases.emplace_back(new test_key_adjust_fusion({ 64, 5, 4, 3 }));
++    test_cases.emplace_back(new test_key_adjust_fusion({ 65, 5, 4, 3 }));
+     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
+     test_cases.emplace_back(new test_silu_back());
+ 

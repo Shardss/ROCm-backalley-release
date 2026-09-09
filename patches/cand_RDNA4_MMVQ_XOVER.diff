@@ -1,0 +1,22 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index f65e0fb..26d0c9a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -381,6 +381,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
+         }
+     }
++    // RDNA4: MMQ beats MMVQ for K-quants once ne11 reaches 4. Ada/Blackwell/GB10/Orin/CDNA1/CDNA2
++    // all carry a measured table here; RDNA fell through to the permissive default.
++    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++        switch (type) {
++            case GGML_TYPE_Q4_K:
++            case GGML_TYPE_Q6_K:
++                return ne11 <= 3;
++            default:
++                break;
++        }
++    }
+     return ne11 <= MMVQ_MAX_BATCH_SIZE;
+ }
+ 
