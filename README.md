@@ -135,7 +135,7 @@ Speed is worthless if the model gets dumber. Frozen base vs golden stack, Qwen3-
 
 | check | base | golden stack | fail threshold | result |
 |---|---|---|---|---|
-| failing ops vs CPU reference | 0 | 0 | any *new* failure | **pass** |
+| failing ops vs CPU reference | 0 | 0 | any *new* failure | **withdrawn — see below** |
 | perplexity | 9.1136 | 9.1122 (**−0.0154%**) | >0.5% drift | **pass** |
 | **mean KL divergence** | — | **0.002916 ± 0.000076** | >0.01 | **pass** |
 | winogrande accuracy | 67.3333 | 67.3333 (**0 pts**) | −2 pts | **pass** |
@@ -144,7 +144,128 @@ Same-top-token agreement: **97.659% ± 0.167**. Median KLD 0.001297.
 
 KL divergence compares the model's full output *distributions* against saved reference logits — it does not care that wording changed, only whether the model's beliefs moved. The residual is consistent with floating-point reduction-order changes, not altered behaviour.
 
+> ### ⚠ Correction (2026-09-09): the ops row above is withdrawn
+>
+> Two faults were found in how that row was produced, and both are worth stating plainly because they
+> affected every "0 failing ops" verdict this project published before this date.
+>
+> **The checker was wrong.** It counted only lines matching `OP(...): FAIL` and never read the process
+> exit code or the `Backend <name>: OK|FAIL` summary. `test-backend-ops` does not mark a backend-level
+> failure on each case — it prints `Failing tests:` and then lists the failing descriptors bare, which
+> that checker ignored. A failing build could therefore report zero failing ops.
+>
+> **One run proves nothing.** `init_tensor_uniform()` seeds a per-thread `std::default_random_engine`
+> from `std::random_device`, so **every run uses different input data**. On this hardware the
+> **unpatched** frozen base fails `test-backend-ops` in **4 of 20 full runs**, on an f16 `ADD` case whose
+> error lands 1.00–1.07e-07 against a 1.0e-07 tolerance. A single-run gate therefore rejects stock
+> upstream llama.cpp about 20% of the time — pass or fail, it was close to a coin toss.
+>
+> **The perplexity, KL divergence and winogrande rows above still stand.** They were measured correctly
+> and are unaffected. Only the ops row is withdrawn.
+>
+> The consequence was real: v1 shipped with a flash-attention regression this gate did not catch. It is
+> fixed in v2, and v1 is left as published on purpose — see **Release v2** below and
+> `RELEASE_NOTES_v2.md`. The corrected checker is `scripts/opscheck.ps1`.
+
 **The stack is 12–26% faster and measurably the same model.**
+
+---
+
+## Release v2
+
+**v2 removes one patch from v1 and adds nine.** The removal matters more than the additions: **#28102
+broke flash attention** on split key/value head dimensions, and v1's single-run gate did not catch it.
+
+`#26301 + #24386 + #25940` (v1, minus #28102)
+`+ #25206 + #27248 + #26504 + #28477 + #27269 + #28552 + #23685 + RDNA4-MMVQ-XOVER + #28398`
+
+Apply order and build instructions: **`RELEASE_NOTES_v2.md`**.
+
+### Gain vs the frozen base
+
+| model | pp512 | tg128 |
+|---|---|---|
+| Qwen3-4B Q4_K_M | +8.1% | **+32.9%** |
+| Qwen3-8B Q4_K_M | +7.2% | +16.5% |
+| OLMoE-1B-7B (MoE) | **+19.3%** | **+54.4%** |
+| gemma-26B-A4B IQ4_XS | +8.0% | +2.6% |
+| rwkv7-1.5B | +11.1% | +34.1% |
+| Qwen3-4B Q1_0 | **−2.8%** | **+83.2%** |
+
+**Quantized KV cache — the largest single win in this release:**
+
+| K/V type | base tg32 | v2 tg32 | gain |
+|---|---|---|---|
+| q4_1 / q4_1 | 42.86 | 147.57 | **+244.3%** |
+| q5_0 / q5_0 | 42.50 | 145.70 | **+242.8%** |
+| q5_1 / q5_1 | 42.70 | 146.10 | **+242.2%** |
+| iq4_nl / iq4_nl | 40.18 | 121.00 | **+201.1%** |
+| q8_0 / q4_0 | 43.02 | 153.42 | **+256.6%** |
+
+Five of eight quantized-KV configurations were running roughly 3× slower than they should. #27248 and
+#27269 restore them. If you run a quantized KV cache, this is the reason to take v2.
+
+Batched decode, Qwen3-4B Q4_K_M, 128 prompt / 64 generate: **693.8 t/s at 8 parallel sequences.**
+
+Op coverage: **OK 14726** vs the base's 14692, with `NOT SUPPORTED` down from 7579 to 7568 — v2 runs
+more shapes than the base, it does not merely run them faster.
+
+### Quality gate — two legs, both passed
+
+v1's gate only ever exercised **batched** work: an `ne11` probe showed **1 of 8282** mul_mat dispatches
+ran at decode width. That is how a flash-attention regression walked through it. v2 adds a decode leg
+(`-b 512 -ub 1`), where the same probe reads **7227 of 7227**.
+
+| check | base | v2 | threshold | result |
+|---|---|---|---|---|
+| perplexity, batched | 9.1136 | 9.1194 (+0.0636%) | >0.5% | **pass** |
+| perplexity, decode | 12.4893 | 12.4687 (−0.1649%) | >0.5% | **pass** |
+| mean KLD, batched | — | 0.002894 (same-top 97.929%) | >0.01 | **pass** |
+| mean KLD, decode | — | 0.00199 (same-top 98.333%) | >0.01 | **pass** |
+
+Every perplexity figure was measured twice and reproduced to four decimal places.
+
+### Correctness, measured against the base rather than assumed
+
+| | full runs failed | families |
+|---|---|---|
+| **v2 stack** | **3 of 20** | ADD_ADD ×2, ADD ×1 |
+| frozen base, unpatched | 4 of 20 | ADD_ADD ×2, ADD ×2, MUL_MAT ×1 |
+
+**v2 fails less often than unpatched upstream.** Every failure on both sides is a marginal-tolerance
+case: the f16 `ADD` family at 1.00–1.07e-07 against 1.0e-07, and one `MUL_MAT(q5_1, n=1)` on the
+*base* at 0.000509 against 0.000500.
+
+One `MUL_MAT_ID(q4_K, n=1)` failure was seen during gating and never recurred — 0 in 28 later full runs
+and 0 in 40 filtered runs. The base's own marginal `MUL_MAT(q5_1, n=1)` failure is the same class of
+event: sibling op, same decode width, quantized type, a margin a hair over tolerance, with no patches
+applied. **Stated honestly: the gate logged that case string but not its error margin, so this is strong
+supporting evidence, not proof.** Compare #28102, which missed by 1.6–8×, reproduced readily, and was
+absent from the base — that is what a real fault looks like.
+
+### Why #28102 was dropped
+
+It breaks four `FLASH_ATTN_EXT` shapes at `hsk=192, hsv=128, kv_view=1` — split key/value head
+dimensions, as used by DeepSeek-style MLA attention — with errors of 0.000815, 0.001260, 0.002247 and
+0.003965 against a 0.000500 tolerance. **The frozen base runs all four of those shapes and reports OK**,
+so this is a regression, not newly exposed coverage. Isolated by removing each v1 patch in turn, 12 runs
+per configuration: dropping #26301, #24386 or #25940 leaves the failures; dropping #28102 removes them.
+
+None of the benchmark models use that attention shape, which is exactly why the quality gate passed it.
+
+The cost of removal is honest and paid in prefill: roughly −4% on most models, −7.3% on gemma-26B.
+Decode and quantized-KV gains are untouched. For a release other people run, a silent accuracy
+regression on a real architecture's attention path is not worth 4% of prefill.
+
+**v1 is deliberately left as published.** It has already been distributed; the correction ships as v2
+rather than by rewriting a release people may already be using. If you are running v1 with an
+MLA-architecture model, move to v2.
+
+### Also rejected
+
+| candidate | verdict |
+|---|---|
+| DPP warp reduction (own experiment) | Fails `test-backend-ops` deterministically — 3 of 3 runs, breaking `GATED_DELTA_NET`, `MUL_MAT_VEC_FUSION` and `TOPK_MOE`, with passing cases collapsing from ~14697 to ~12480. Its measured gain was +0.5–1.2%, at or below the ~0.95% noise floor. It had been cleared twice by the defective checker described above. |
 
 ---
 
@@ -194,18 +315,23 @@ Or **download the prebuilt archive from Releases** — self-contained, no ROCm i
 
 ## Database
 
-`database.csv` — every candidate, its verdict, the numbers, and the reasoning. 30 entries.
+`database.csv` — every candidate, its verdict, the numbers, and the reasoning. 66 entries.
 
 | status | count |
 |---|---|
-| VALIDATED | 5 |
-| NO_EFFECT | 8 |
-| NO_REGRESSION_ONLY (other arch) | 6 |
-| NEEDS_PORT_HARD | 2 |
+| VALIDATED | 14 |
+| NO_EFFECT | 14 |
+| NOT_APPLICABLE | 10 |
+| NO_REGRESSION_ONLY | 6 |
+| RESOLVED | 4 |
+| CORRECTNESS_ONLY | 2 |
+| DEFERRED | 2 |
+| CONFIRM_ONLY | 2 |
 | NEGLIGIBLE | 2 |
-| CONDITIONAL / SUPERSEDED / CUDA_ONLY / NOT_APPLICABLE / CORRECTNESS_ONLY / DEFERRED / CONFIRM_ONLY | 7 |
+| COMPLETE | 2 |
+| AWAITING_DECISION / CONDITIONAL / CUDA_ONLY / PASSED / REJECTED / REJECTED_FROM_V2 / SUPERSEDED / UPSTREAM_ISSUE | 1 each |
 
-**Hit rate: roughly 1 in 6.** Two of the four PRs in the stack were initially rejected by a mechanical `git apply` check and only recovered by reading the code.
+**Hit rate: roughly 1 in 5.** Of 66 candidates examined, 12 are in the v2 stack. Several were initially rejected by a mechanical `git apply` check and only recovered by reading the code — including #23685, which needed a hand port, and #27269, which needed a one-line HIP fix the upstream PR omits.
 
 ---
 

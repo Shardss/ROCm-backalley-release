@@ -1,0 +1,207 @@
+diff --git a/docs/ops.md b/docs/ops.md
+index cc8d253820cc..04b3601e9c7b 100644
+--- a/docs/ops.md
++++ b/docs/ops.md
+@@ -14,7 +14,7 @@ Legend:
+ 
+ | Operation | BLAS | CANN | CPU | CUDA | ET | HTP | MTL | OpenCL | SYCL | Vulkan | WebGPU | ZenDNN | zDNN |
+ |-----------|------|------|------|------|------|------|------|------|------|------|------|------|------|
+-|                              ABS | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
++|                              ABS | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+ |                              ACC | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+ |                              ADD | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+ |                             ADD1 | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+diff --git a/docs/ops/CUDA.csv b/docs/ops/CUDA.csv
+index 22c84dd143d9..c67053854746 100644
+--- a/docs/ops/CUDA.csv
++++ b/docs/ops/CUDA.csv
+@@ -41,8 +41,8 @@
+ "CUDA0","ROUND","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+ "CUDA0","TRUNC","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+ "CUDA0","TRUNC","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+-"CUDA0","ABS","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+-"CUDA0","ABS","type=f16,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
++"CUDA0","ABS","type=f16,ne_a=[128,2,2,2],v=1","support","1","yes","CUDA"
++"CUDA0","ABS","type=f16,ne_a=[5,7,11,13],v=1","support","1","yes","CUDA"
+ "CUDA0","SGN","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+ "CUDA0","SGN","type=f16,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
+ "CUDA0","NEG","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+@@ -125,8 +125,8 @@
+ "CUDA0","ROUND","type=f32,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+ "CUDA0","TRUNC","type=f32,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+ "CUDA0","TRUNC","type=f32,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+-"CUDA0","ABS","type=f32,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+-"CUDA0","ABS","type=f32,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
++"CUDA0","ABS","type=f32,ne_a=[128,2,2,2],v=1","support","1","yes","CUDA"
++"CUDA0","ABS","type=f32,ne_a=[5,7,11,13],v=1","support","1","yes","CUDA"
+ "CUDA0","SGN","type=f32,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+ "CUDA0","SGN","type=f32,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
+ "CUDA0","NEG","type=f32,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+@@ -18751,3 +18751,11 @@
+ "CUDA0","CROSS_ENTROPY_LOSS_BACK","type=f32,ne=[30000,1,1,1]","support","1","yes","CUDA"
+ "CUDA0","OPT_STEP_ADAMW","type=f32,ne=[10,5,4,3]","support","1","yes","CUDA"
+ "CUDA0","OPT_STEP_SGD","type=f32,ne=[10,5,4,3]","support","1","yes","CUDA"
++"CUDA0","ABS","type=f16,ne_a=[257,3,2,2],v=3","support","1","yes","CUDA"
++"CUDA0","ABS","type=f16,ne_a=[5,7,11,3],v=7","support","1","yes","CUDA"
++"CUDA0","ABS","type=f16,ne_a=[257,3,2,2],v=3,inplace=1","support","1","yes","CUDA"
++"CUDA0","ABS","type=f16,ne_a=[5,7,11,3],v=7,inplace=1","support","1","yes","CUDA"
++"CUDA0","ABS","type=f32,ne_a=[257,3,2,2],v=3","support","1","yes","CUDA"
++"CUDA0","ABS","type=f32,ne_a=[5,7,11,3],v=7","support","1","yes","CUDA"
++"CUDA0","ABS","type=f32,ne_a=[257,3,2,2],v=3,inplace=1","support","1","yes","CUDA"
++"CUDA0","ABS","type=f32,ne_a=[5,7,11,3],v=7,inplace=1","support","1","yes","CUDA"
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 45e9537f0e45..cc2c57fe416a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5073,6 +5073,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(op)) {
+                 case GGML_UNARY_OP_ABS:
++                    return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
++                           op->type == op->src[0]->type &&
++                           ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op);
+                 case GGML_UNARY_OP_SGN:
+                 case GGML_UNARY_OP_NEG:
+                 case GGML_UNARY_OP_STEP:
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index d3e594878fcc..5569da649c56 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -154,8 +154,58 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     }
+ }
+ 
++template <typename T>
++static __global__ void abs_strided_kernel(const T * x, T * dst, const int64_t n,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2,
++        const size_t s01, const size_t s02, const size_t s03,
++        const size_t s1, const size_t s2, const size_t s3) {
++    ggml_cuda_pdl_lc();
++    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++
++    const int64_t i0 = i % ne0;
++    const int64_t i1 = (i / ne0) % ne1;
++    const int64_t i2 = (i / (ne0*ne1)) % ne2;
++    const int64_t i3 = i / (ne0*ne1*ne2);
++
++    ggml_cuda_pdl_sync();
++    dst[i0 + i1*s1 + i2*s2 + i3*s3] = (T)op_abs((float)x[i0 + i1*s01 + i2*s02 + i3*s03]);
++}
++
++template <typename T>
++static void abs_strided_cuda(const ggml_tensor * src0, ggml_tensor * dst, cudaStream_t stream) {
++    const int64_t n = ggml_nelements(dst);
++    const int64_t num_blocks = (n + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
++    const ggml_cuda_kernel_launch_params launch_params(num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
++    ggml_cuda_kernel_launch(abs_strided_kernel<T>, launch_params, (const T *)src0->data, (T *)dst->data, n,
++        src0->ne[0], src0->ne[1], src0->ne[2],
++        src0->nb[1]/sizeof(T), src0->nb[2]/sizeof(T), src0->nb[3]/sizeof(T),
++         dst->nb[1]/sizeof(T),  dst->nb[2]/sizeof(T),  dst->nb[3]/sizeof(T));
++}
++
+ void ggml_cuda_op_abs(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-    ggml_cuda_op_unary<op_abs>(ctx, dst);
++    const ggml_tensor * src0 = dst->src[0];
++    if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
++        ggml_cuda_op_unary<op_abs>(ctx, dst);
++        return;
++    }
++
++    GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst));
++    GGML_ASSERT(ggml_are_same_shape(src0, dst));
++    GGML_ASSERT(src0->type == dst->type);
++
++    switch (src0->type) {
++        case GGML_TYPE_F32:
++            abs_strided_cuda<float>(src0, dst, ctx.stream());
++            break;
++        case GGML_TYPE_F16:
++            abs_strided_cuda<half>(src0, dst, ctx.stream());
++            break;
++        default:
++            GGML_ABORT("unsupported type");
++    }
+ }
+ 
+ void ggml_cuda_op_sgn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c93e41b2e253..577dd0f78cf4 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2024,17 +2024,18 @@ struct test_unary : public test_case {
+     const ggml_unary_op op;
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+-    int v; // view (1 : non-contiguous a)
++    int v; // view (1: padded rows, 2: offset, 4: permuted outer dimensions)
++    const bool inplace;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR3(type, ne_a, v);
++        return VARS_TO_STR3(type, ne_a, v) + (inplace ? ",inplace=1" : "");
+     }
+ 
+     test_unary(ggml_unary_op op,
+             ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
+-            int v = 0)
+-        : op(op), type(type), ne_a(ne_a), v(v) {}
++            int v = 0, bool inplace = false)
++        : op(op), type(type), ne_a(ne_a), v(v), inplace(inplace) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
+@@ -2054,7 +2055,8 @@ struct test_unary : public test_case {
+             }
+             ggml_set_name(a, "a");
+ 
+-            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
++            const size_t offset = (v & 2) ? a->nb[0] + a->nb[1] + a->nb[2] + a->nb[3] : 0;
++            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], offset);
+             ggml_set_name(a, "view_of_a");
+         } else {
+             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+@@ -2064,7 +2066,12 @@ struct test_unary : public test_case {
+             ggml_set_name(a, "a");
+         }
+ 
+-        ggml_tensor * out = ggml_unary(ctx, a, op);
++        if (v & 4) {
++            a = ggml_permute(ctx, a, 0, 2, 3, 1);
++            ggml_set_name(a, "permuted_a");
++        }
++
++        ggml_tensor * out = inplace ? ggml_unary_inplace(ctx, a, op) : ggml_unary(ctx, a, op);
+         ggml_set_name(out, "out");
+ 
+         return out;
+@@ -8704,6 +8711,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
++        for (bool inplace : {false, true}) {
++            test_cases.emplace_back(new test_unary(GGML_UNARY_OP_ABS, type, {257, 3, 2, 2}, 3, inplace));
++            test_cases.emplace_back(new test_unary(GGML_UNARY_OP_ABS, type, {5, 7, 11, 3}, 7, inplace));
++        }
++    }
++
+     // fused relu + sqr (squared ReLU)
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
+@@ -10681,6 +10695,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
++        for (int v : {0, 1}) {
++            test_cases.emplace_back(new test_unary(GGML_UNARY_OP_ABS, type, {4096, 16, 2, 2}, v));
++        }
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
