@@ -8,6 +8,39 @@ This project does that measuring, keeps what works, and publishes both the evide
 
 ---
 
+## Latest release: v3
+
+**v3 fixes a prefill regression that shipped in both v1 and v2.**
+
+`#25940`'s RDNA4 table routes `Q6_K` matmuls to hipBLAS above `ne11 = 256`. On gfx1201 that path
+is 2.6x to 6.7x slower than MMQ, so batched prefill lost up to **85%** against the *unpatched*
+base — in every release to date. Neither previous quality gate measured the shape it lived in.
+
+`Qwen3-4B Q4_K_M`, `-fa 1`, prefill throughput (tok/s):
+
+| ne11 | base | v2 (shipped) | v3 |
+|---|---|---|---|
+| 384 | 5,376.65 | **793.92** (−85.2%) | 5,767.70 (+7.3%) |
+| 512 | 5,944.91 | **2,352.14** (−60.4%) | 6,366.96 (+7.1%) |
+| 640 | 5,433.94 | **1,204.93** (−77.8%) | 5,785.50 (+6.5%) |
+| 1024 | 6,190.17 | **3,555.84** (−42.6%) | 6,583.93 (+6.4%) |
+
+**If you run parallel sequences — a server, an agent, batched work — upgrade.** If you only ever
+run one prompt at a time, v2 was about 4 points faster on single-sequence prefill, and v3 gives
+that up deliberately to close the hole.
+
+v3 also retires one of our three non-upstream patches: upstream `#28079` fixed the root cause our
+`cand_27269_with_hipfix.diff` was working around.
+
+Full detail — seven models, quantized-KV sweep, batched sweep, quality gate, and the limits
+(IQ-quantised models gain almost nothing from this stack):
+**[RELEASE_NOTES_v3.md](RELEASE_NOTES_v3.md)**
+
+v1 and v2 are **left as published**. They have been distributed, and rewriting them is worse than
+shipping a clear correction.
+
+---
+
 ## ⚠ AI agent disclosure
 
 **Every step in this project was performed by an AI agent (Claude, via Claude Code), driving a Windows machine over SSH.**

@@ -1,0 +1,17 @@
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 8c93b0c..dddbeb1 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -393,7 +393,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+                 case GGML_TYPE_Q5_0:
+                     return ne11 <= 336;
+                 case GGML_TYPE_Q6_K:
++                    // gfx1201: the hipBLAS path collapses batched prefill
++                    // (-85% at ne11=384). Measured: MMQ wins at every ne11.
++                    return true;
+                 case GGML_TYPE_Q5_1:
++                    // left at the upstream threshold - not measured here,
++                    // none of the benchmark models use Q5_1.
+                     return ne11 <= 256;
+                 case GGML_TYPE_Q2_K:
+                     return ne11 <= 96;
