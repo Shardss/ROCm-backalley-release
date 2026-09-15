@@ -44,9 +44,9 @@ and the VRAM arithmetic that decides how much context actually fits:
 
 ---
 
-## ⚠ AI agent disclosure
+## AI agent disclosure
 
-**This project was performed with frequent help from an AI agent (Claude, via Claude Code), driving a Windows machine over SSH.**
+**This project was performed with frequent help from an AI agent.**
 
 All *numbers* are machine-produced by `llama-bench`, `llama-perplexity` and `test-backend-ops`, executed by the agent. Direction and the final calls are the repository owner's: which candidates to chase, how far to push a branch, when an answer was not good enough, and what ships. Several findings here exist only because the owner rejected the agent's first conclusion and sent it back to measure again — including results the agent had written off.
 
