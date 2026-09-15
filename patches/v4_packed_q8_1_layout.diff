@@ -1,0 +1,217 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 25020d4..bb6436b 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -76,6 +76,10 @@ static __device__ __forceinline__ float vec_dot_q_cuda_q8_1_layout(
+         return vec_dot_q4_K_q8_1_layout<q8_1_layout_block_size>(vbq, y_layout, kby, kbx, iqs);
+     } else if constexpr (type == GGML_TYPE_Q5_K) {
+         return vec_dot_q5_K_q8_1_layout<q8_1_layout_block_size>(vbq, y_layout, kby, kbx, iqs);
++    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
++        return vec_dot_iq4_xs_q8_1_layout<q8_1_layout_block_size>(vbq, y_layout, kby, kbx, iqs);
++    } else if constexpr (type == GGML_TYPE_Q3_K) {
++        return vec_dot_q3_K_q8_1_layout<q8_1_layout_block_size>(vbq, y_layout, kby, kbx, iqs);
+     } else {
+         return vec_dot_q6_K_q8_1_layout<q8_1_layout_block_size>(vbq, y_layout, kby, kbx, iqs);
+     }
+@@ -700,6 +704,54 @@ struct mmvq_layout_policy<GGML_TYPE_Q6_K, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_128> : mmv
+ template <>
+ struct mmvq_layout_policy<GGML_TYPE_Q6_K, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_256> : mmvq_q8_1_packed_k_layout_policy<GGML_TYPE_Q6_K, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_256> {};
+ 
++// IQ4_XS opts into the packed q8_1 layout WITHOUT changing the thread geometry: same lanes per
++// block, same quant_index, same nwarps as the standard path. Only the activation layout differs,
++// so a measured difference is attributable to that alone. The K-quant packed policy cannot be
++// reused here - it hard-codes two q8_1 blocks per dot and four lanes per x block, while IQ4_XS
++// uses one and eight.
++template <ggml_type type, int q8_1_layout_block_size>
++struct mmvq_q8_1_packed_iq_layout_policy {
++    static_assert(type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q3_K);
++    static_assert(mmvq_q8_1_layout_block_size_is_valid<q8_1_layout_block_size>());
++    static_assert(q8_1_layout_block_size != MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_32);
++
++    static constexpr bool uses_layout = true;
++    static constexpr bool supported   = true;
++
++    static constexpr int q8_1_blocks        = q8_1_layout_block_size / QK8_1;
++    static constexpr int qi                 = ggml_cuda_type_traits<type>::qi;
++    static constexpr int vdr                = get_vdr_mmvq(type);
++    static constexpr int lanes_per_block    = qi/vdr;
++    static constexpr int threads_per_layout = q8_1_layout_block_size / sizeof(int32_t);
++
++    // Match the K-quant packed policy: one warp per layout block, one row per CUDA block.
++    // The default tuning picks multi-row blocks, which is the only structural difference
++    // left between this and the paths that are known to work.
++    static constexpr __host__ __device__ int nwarps(int, mmvq_parameter_table_id, bool = false, bool = false) {
++        return threads_per_layout <= WARP_SIZE ? 1 : threads_per_layout / WARP_SIZE;
++    }
++
++    static constexpr __host__ __device__ int rows_per_block(int, mmvq_parameter_table_id, bool = false, int = 1) {
++        return 1;
++    }
++
++    static __device__ __forceinline__ int quant_index(const int tid) {
++        return vdr * (tid % lanes_per_block);
++    }
++};
++
++template <>
++struct mmvq_layout_policy<GGML_TYPE_IQ4_XS, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_128> : mmvq_q8_1_packed_iq_layout_policy<GGML_TYPE_IQ4_XS, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_128> {};
++
++template <>
++struct mmvq_layout_policy<GGML_TYPE_IQ4_XS, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_256> : mmvq_q8_1_packed_iq_layout_policy<GGML_TYPE_IQ4_XS, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_256> {};
++
++template <>
++struct mmvq_layout_policy<GGML_TYPE_Q3_K, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_128> : mmvq_q8_1_packed_iq_layout_policy<GGML_TYPE_Q3_K, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_128> {};
++
++template <>
++struct mmvq_layout_policy<GGML_TYPE_Q3_K, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_256> : mmvq_q8_1_packed_iq_layout_policy<GGML_TYPE_Q3_K, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_256> {};
++
+ template <ggml_type type, int q8_1_layout_block_size>
+ static constexpr __host__ __device__ bool mmvq_type_supports_q8_1_layout() {
+     return mmvq_layout_policy<type, q8_1_layout_block_size>::supported;
+@@ -707,7 +759,8 @@ static constexpr __host__ __device__ bool mmvq_type_supports_q8_1_layout() {
+ 
+ template <ggml_type type>
+ static constexpr int mmvq_packed_k_layout_block_size_for_type() {
+-    static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K);
++    static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
++                  type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q3_K);
+ 
+     if constexpr (mmvq_type_supports_q8_1_layout<type, MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_128>()) {
+         return MMVQ_Q8_1_LAYOUT_BLOCK_SIZE_128;
+@@ -724,6 +777,8 @@ static int mmvq_select_q8_1_layout_block_size(ggml_type type, int64_t ncols_dst)
+         case GGML_TYPE_Q4_K: return mmvq_packed_k_layout_block_size_for_type<GGML_TYPE_Q4_K>();
+         case GGML_TYPE_Q5_K: return mmvq_packed_k_layout_block_size_for_type<GGML_TYPE_Q5_K>();
+         case GGML_TYPE_Q6_K: return mmvq_packed_k_layout_block_size_for_type<GGML_TYPE_Q6_K>();
++        case GGML_TYPE_IQ4_XS: return mmvq_packed_k_layout_block_size_for_type<GGML_TYPE_IQ4_XS>();
++        case GGML_TYPE_Q3_K: return mmvq_packed_k_layout_block_size_for_type<GGML_TYPE_Q3_K>();
+         default: return MMVQ_Q8_1_BLOCK_SIZE_STANDARD;
+     }
+ }
+@@ -1546,10 +1601,11 @@ static void mul_mat_vec_q_switch_type(
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
+         case GGML_TYPE_Q3_K:
+-            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q3_K>
++            mul_mat_vec_q_dispatch_q8_1_layout<GGML_TYPE_Q3_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
++                 q8_1_layout_block_size);
+             break;
+         case GGML_TYPE_Q4_K:
+             mul_mat_vec_q_dispatch_q8_1_layout<GGML_TYPE_Q4_K>
+@@ -1615,10 +1671,11 @@ static void mul_mat_vec_q_switch_type(
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
+         case GGML_TYPE_IQ4_XS:
+-            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_XS>
++            mul_mat_vec_q_dispatch_q8_1_layout<GGML_TYPE_IQ4_XS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
++                 q8_1_layout_block_size);
+             break;
+         case GGML_TYPE_IQ3_S:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_S>
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 2f99481..582336b 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1147,6 +1147,49 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
+     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+ }
+ 
++// Same maths as vec_dot_q3_K_q8_1 above; only the q8_1 activations come from the packed layout.
++// Q3_K touches QR3_K=4 q8_1 blocks per call, one int from each, so each needs its own
++// outer/inner index into the grouped layout.
++template <int q8_1_layout_block_size>
++static __device__ __forceinline__ float vec_dot_q3_K_q8_1_layout(
++        const void * __restrict__ vbq,
++        const block_q8_1_layout<q8_1_layout_block_size> * __restrict__ y_layout,
++        const int & kby,
++        const int & kbx,
++        const int iqs) {
++    static_assert(q8_1_layout_block_size % QK8_1 == 0);
++    constexpr int q8_1_blocks       = block_q8_1_layout<q8_1_layout_block_size>::q8_1_blocks;
++    constexpr int q8_1_qs_per_block = QK8_1 / sizeof(int32_t);
++
++    const block_q3_K * bq3_K = (const block_q3_K *) vbq + kbx;
++
++    const int bq8_offset   = QR3_K * (iqs / (QI3_K/2));
++    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
++
++    const float d = bq3_K->d;
++
++    const int vl = get_int_b2(bq3_K->qs, iqs);
++    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
++
++    int    u[QR3_K];
++    float d8[QR3_K];
++
++#pragma unroll
++    for (int i = 0; i < QR3_K; ++i) {
++        const int block_offset = kby + bq8_offset + i;
++        const int block_outer  = block_offset / q8_1_blocks;
++        const int block_inner  = block_offset % q8_1_blocks;
++
++        const block_q8_1_layout<q8_1_layout_block_size> * by = y_layout + block_outer;
++        const int32_t * q8 = by->qs + block_inner * q8_1_qs_per_block;
++
++        u[i]  = q8[iqs % QI8_1];
++        d8[i] = __low2float(by->ds[block_inner]);
++    }
++
++    return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
++}
++
+ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -1795,3 +1838,45 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
+     return d * sumi;
+ }
++
++// Same maths as vec_dot_iq4_xs_q8_1 above; only the q8_1 activations are read from the packed
++// layout instead of the standard interleaved one. The packed layout stores all scales first and
++// then all quants for a group of blocks, so the 32-byte qs read lands aligned rather than
++// straddling a 36-byte {ds,qs} struct. One q8_1 block per call, matching the standard version -
++// the K-quant packed policy assumes two, which is why IQ4_XS needs its own policy.
++template <int q8_1_layout_block_size>
++static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_layout(
++        const void * __restrict__ vbq,
++        const block_q8_1_layout<q8_1_layout_block_size> * __restrict__ y_layout,
++        const int & kby,
++        const int & kbx,
++        const int iqs) {
++    static_assert(q8_1_layout_block_size % QK8_1 == 0);
++    constexpr int q8_1_blocks       = block_q8_1_layout<q8_1_layout_block_size>::q8_1_blocks;
++    constexpr int q8_1_qs_per_block = QK8_1 / sizeof(int32_t);
++
++    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
++
++    const int block_offset = kby + iqs/4;
++    const int block_outer  = block_offset / q8_1_blocks;
++    const int block_inner  = block_offset % q8_1_blocks;
++
++    const block_q8_1_layout<q8_1_layout_block_size> * by = y_layout + block_outer;
++    const int32_t * q8 = by->qs + block_inner * q8_1_qs_per_block;
++
++    int sumi = 0;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
++        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
++
++        sumi = ggml_cuda_dp4a(v.x, q8[j + 0], sumi);
++        sumi = ggml_cuda_dp4a(v.y, q8[j + 4], sumi);
++    }
++
++    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
++    sumi *= ls - 32;
++
++    const float d = __half2float(bq4->d) * __low2float(by->ds[block_inner]);
++    return d * sumi;
++}

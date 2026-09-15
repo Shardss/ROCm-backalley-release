@@ -1,0 +1,98 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 7442bc2..f4a3063 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -661,6 +661,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+     }
+ }
+ 
++
+ template <int ncols1>
+ __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+ static __global__ void flash_attn_mask_to_KV_max(
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 126a4c4..f9ea8bb 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -6,6 +6,25 @@
+ 
+ using namespace ggml_cuda_mma;
+ 
++// Whether the KQ mask has to be loaded and added for this KV block.
++//
++// ncols2 > 1 implies mask != nullptr (the GQA path requires a mask), so the two forms below are
++// equivalent. They do NOT generate equivalent code, and the better choice differs by vendor:
++//
++//   RDNA (gfx1201, measured): ncols2 is a template parameter, so `ncols2 > 1` folds to a
++//     compile-time true and the mask load becomes unconditional straight-line code. That inflates
++//     the live range and costs ~30 extra VGPRs of spill inside the KV loop at head dim 128
++//     (210 -> 179 spills), worth +9.3% / +14.2% prefill at 8k / 16k of context.
++//   NVIDIA (sm_120, measured): the opposite. Branching on the pointer spills MORE
++//     (12 -> 152 bytes spill stores, 12 -> 608 bytes spill loads), so keep the upstream form.
++//
++// CDNA is untested; it takes the upstream form until someone measures it.
++#if defined(AMD_WMMA_AVAILABLE)
++#define GGML_FATTN_MASK_NEEDED(ncols2, mask_h) ((mask_h) != nullptr)
++#else
++#define GGML_FATTN_MASK_NEEDED(ncols2, mask_h) ((ncols2) > 1 || (mask_h))
++#endif // defined(AMD_WMMA_AVAILABLE)
++
+ // Config options for the MMA kernel.
+ // Should not affect results, only speed/register pressure/shared memory use.
+ struct fattn_mma_config {
+@@ -148,8 +167,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+ 
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8,  64, 2,  32,  64,  64,  64, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16,  64, 2,  32,  64,  64,  64, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  32,  64,  64,  64, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  32,  64,  64,  64, 1, true);
+ 
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 2,  32,  96,  64,  64, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 2,  32,  96,  64,  64, 1, true);
+@@ -632,7 +651,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     } else {
+         // the sparse mask values are gathered per element, always load them synchronously
+         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
+-        if (ncols2 > 1 || mask_h) {
++        if (GGML_FATTN_MASK_NEEDED(ncols2, mask_h)) {
+             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+         }
+@@ -732,7 +751,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     float KQ_rowsum_add[cols_per_thread] = {0.0f};
+ 
+     if constexpr (cols_per_warp == 8) {
+-        if (ncols2 > 1 || mask_h) {
++        if (GGML_FATTN_MASK_NEEDED(ncols2, mask_h)) {
+ #pragma unroll
+             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
+                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
+@@ -794,7 +813,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+             }
+         }
+     } else { // not Turing mma or T_B_KQ::I > 8
+-        if (ncols2 > 1 || mask_h) {
++        if (GGML_FATTN_MASK_NEEDED(ncols2, mask_h)) {
+ #pragma unroll
+             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
+                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
+@@ -980,7 +999,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+         cp_async_wait_all();
+         __syncthreads();
+         if (!last_iter) {
+-            if (ncols2 > 1 || mask_h) {
++            if (GGML_FATTN_MASK_NEEDED(ncols2, mask_h)) {
+                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+             }
+@@ -1306,7 +1325,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         constexpr bool use_cp_async = true;
+         constexpr bool oob_check    = false;
+         constexpr int  k_VKQ_sup    = nbatch_fa;
+-        if (ncols2 > 1 || mask_h) {
++        if (GGML_FATTN_MASK_NEEDED(ncols2, mask_h)) {
+             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+         }

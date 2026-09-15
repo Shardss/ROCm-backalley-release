@@ -1,0 +1,57 @@
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -10,15 +10,11 @@
+ //
+ // ncols2 > 1 implies mask != nullptr (the GQA path requires a mask), so the two forms below are
+ // equivalent. They do NOT generate equivalent code, and the better choice differs by vendor:
+-//
+-//   RDNA (gfx1201, measured): ncols2 is a template parameter, so `ncols2 > 1` folds to a
+-//     compile-time true and the mask load becomes unconditional straight-line code. That inflates
+-//     the live range and costs ~30 extra VGPRs of spill inside the KV loop at head dim 128
+-//     (210 -> 179 spills), worth +9.3% / +14.2% prefill at 8k / 16k of context.
+-//   NVIDIA (sm_120, measured): the opposite. Branching on the pointer spills MORE
+-//     (12 -> 152 bytes spill stores, 12 -> 608 bytes spill loads), so keep the upstream form.
+-//
+-// CDNA is untested; it takes the upstream form until someone measures it.
++//   RDNA (gfx1201, measured): ncols2 is a template parameter, so the upstream form folds to a
++//     compile-time true and the mask load becomes unconditional straight-line code, costing ~30
++//     extra VGPRs of spill inside the KV loop at head dim 128 (210 -> 179).
++//   NVIDIA (sm_120, measured): the opposite - branching on the pointer spills MORE.
++// CDNA untested; it takes the upstream form.
+ #if defined(AMD_WMMA_AVAILABLE)
+ #define GGML_FATTN_MASK_NEEDED(ncols2, mask_h) ((mask_h) != nullptr)
+ #else
+@@ -175,10 +171,10 @@
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 32, 128, 2,  64,  96,  64,  64, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 64, 128, 2,  64,  96,  64,  64, 1, true);
+ 
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128, 128, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 64, 64, 128, 1, false);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 64, 64, 128, 1, false);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 64, 64, 128, 1, false);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 64, 64, 128, 1, false);
+ 
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
+@@ -667,7 +663,7 @@
+         }
+ #if defined(AMD_WMMA_AVAILABLE)
+         // For large head dims, K/V bypass LDS staging below so sync mask here.
+-        if (DKQ > 128 && (ncols2 > 1 || mask_h)) {
++        if (DKQ > 128 && GGML_FATTN_MASK_NEEDED(ncols2, mask_h)) {
+             __syncthreads();
+         }
+ #endif // AMD_WMMA_AVAILABLE
+@@ -1132,7 +1128,7 @@
+             // However, tile_mask still lives in LDS — the next iteration's load_mask
+             // would overwrite it while a slow warp might still be reading it in softmax.
+             // Keep the barrier when mask is active to prevent this WAR hazard.
+-            if (DKQ <= 128 || ncols2 > 1 || mask_h)
++            if (DKQ <= 128 || GGML_FATTN_MASK_NEEDED(ncols2, mask_h))
+ #endif // AMD_WMMA_AVAILABLE
+             __syncthreads(); // Needed if tile_K == tile_V, or if tile_mask is in use.
+         }

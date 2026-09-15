@@ -8,56 +8,61 @@ This project does that measuring, keeps what works, and publishes both the evide
 
 ---
 
-## Latest release: v3
+## Latest release: v4
 
-**v3 fixes a prefill regression that shipped in both v1 and v2.**
+**v4 is a long-context release.** Flash attention on this card was spilling registers inside the
+loop that walks the KV cache, so the cost grew with every token of context. The compiler reports it
+directly:
 
-`#25940`'s RDNA4 table routes `Q6_K` matmuls to hipBLAS above `ne11 = 256`. On gfx1201 that path
-is 2.6x to 6.7x slower than MMQ, so batched prefill lost up to **85%** against the *unpatched*
-base — in every release to date. Neither previous quality gate measured the shape it lived in.
+| kernel | v3 | v4 |
+|---|---|---|
+| head_dim 128 — most models | 210 spills | **37** |
+| head_dim 256 — Qwen3.8-27B | *kernel disabled on AMD* | **149** |
 
-`Qwen3-4B Q4_K_M`, `-fa 1`, prefill throughput (tok/s):
+Prefill, measured from the packaged binaries against the shipped v3:
 
-| ne11 | base | v2 (shipped) | v3 |
-|---|---|---|---|
-| 384 | 5,376.65 | **793.92** (−85.2%) | 5,767.70 (+7.3%) |
-| 512 | 5,944.91 | **2,352.14** (−60.4%) | 6,366.96 (+7.1%) |
-| 640 | 5,433.94 | **1,204.93** (−77.8%) | 5,785.50 (+6.5%) |
-| 1024 | 6,190.17 | **3,555.84** (−42.6%) | 6,583.93 (+6.4%) |
+| model | at 8k context | at 16k context |
+|---|---|---|
+| Qwen3-4B Q4_K_M | **+14.2%** | **+22.5%** |
+| Qwen3-8B Q4_K_M | **+9.0%** | — |
+| Qwen3.8-27B IQ4_XS | **+13.3%** | **+20.3%** |
 
-**If you run parallel sequences — a server, an agent, batched work — upgrade.** If you only ever
-run one prompt at a time, v2 was about 4 points faster on single-sequence prefill, and v3 gives
-that up deliberately to close the hole.
+Plus **+6.0% decode on gemma-26B IQ4_XS**, from extending #23685's packed activation layout to the
+IQ types it never covered.
 
-v3 also retires one of our three non-upstream patches: upstream `#28079` fixed the root cause our
-`cand_27269_with_hipfix.diff` was working around.
+**The gain grows with context depth and is near zero on an empty cache** — that is the signature of
+the bug, which lived inside the KV loop. If you run short prompts, v4 gives you almost nothing.
 
-Full detail — seven models, quantized-KV sweep, batched sweep, quality gate, and the limits
-(IQ-quantised models gain almost nothing from this stack):
-**[RELEASE_NOTES_v3.md](RELEASE_NOTES_v3.md)**
+**One caveat, stated up front: v4 is not bit-identical to upstream and v3 was.** Perplexity moves
++0.115% and ~2.2% of tokens pick a different top token than the base. That is the flash-attention
+changes altering accumulation order. The quality gate passes. If you need output identical to
+upstream, stay on v3.
 
-v1 and v2 are **left as published**. They have been distributed, and rewriting them is worse than
-shipping a clear correction.
+Full detail — the retune that makes PR #26419 worth anything, all measurements, the quality gate,
+and the VRAM arithmetic that decides how much context actually fits:
+**[RELEASE_NOTES_v4.md](RELEASE_NOTES_v4.md)**
 
 ---
 
 ## ⚠ AI agent disclosure
 
-**Every step in this project was performed by an AI agent (Claude, via Claude Code), driving a Windows machine over SSH.**
+**This project was performed with frequent help from an AI agent (Claude, via Claude Code), driving a Windows machine over SSH.**
 
-All *numbers* are machine-produced by `llama-bench`, `llama-perplexity` and `test-backend-ops`. All *judgement* is the agent's. Specifically, these steps were done manually by the AI agent and are not automated:
+All *numbers* are machine-produced by `llama-bench`, `llama-perplexity` and `test-backend-ops`, executed by the agent. Direction and the final calls are the repository owner's: which candidates to chase, how far to push a branch, when an answer was not good enough, and what ships. Several findings here exist only because the owner rejected the agent's first conclusion and sent it back to measure again — including results the agent had written off.
 
-| Step | Done manually by an AI agent (Claude) |
+| Step | Who |
 |---|---|
-| Candidate selection from ~1,200 open PRs | ✅ read titles/diffs, decided relevance to gfx1201 |
-| Deciding whether a PR is "still valid" | ✅ read the code, checked whether upstream already merged the idea |
-| **Porting #24386 and #26301 to the frozen base** | ✅ **the merged code was written by the agent, not the PR authors** |
-| Triage verdicts (superseded / not-applicable / CUDA-only) | ✅ |
-| Deciding the stacking order and what to exclude | ✅ |
-| Writing all harness scripts | ✅ |
-| Interpreting results and writing this README | ✅ |
+| Candidate selection from ~1,200 open PRs | agent read titles/diffs and proposed; owner chose |
+| Deciding whether a PR is "still valid" | agent read the code; owner arbitrated |
+| **Porting #24386 and #26301 to the frozen base** | **agent wrote the merged code** |
+| Triage verdicts (superseded / not-applicable / CUDA-only) | agent |
+| Which branches to pursue, and how far | owner |
+| Stacking order and what to exclude | owner, on the agent's measurements |
+| Harness scripts, builds, benchmark runs | agent |
+| Interpreting results and drafting this README | agent drafted; owner challenged and corrected |
+| What ships in a release | owner |
 
-Two ports (#23685, #26419) were **deliberately abandoned** rather than guessed at — see *Not ported*.
+Two ports (#23685, #26419) were **deliberately abandoned** at v3 rather than guessed at — see *Not ported*. Both were completed later, in v4.
 
 The human owner of this repository is responsible for its contents.
 
@@ -209,8 +214,23 @@ KL divergence compares the model's full output *distributions* against saved ref
 **v2 removes one patch from v1 and adds nine.** The removal matters more than the additions: **#28102
 broke flash attention** on split key/value head dimensions, and v1's single-run gate did not catch it.
 
-`#26301 + #24386 + #25940` (v1, minus #28102)
-`+ #25206 + #27248 + #26504 + #28477 + #27269 + #28552 + #23685 + RDNA4-MMVQ-XOVER + #28398`
+**Carried over from v1:** [#26301](https://github.com/ggml-org/llama.cpp/pull/26301), [#24386](https://github.com/ggml-org/llama.cpp/pull/24386), [#25940](https://github.com/ggml-org/llama.cpp/pull/25940) — minus [#28102](https://github.com/ggml-org/llama.cpp/pull/28102), dropped.
+
+### What v2 adds
+
+| PR | title | individual gain on gfx1201 |
+|---|---|---|
+| [#23685](https://github.com/ggml-org/llama.cpp/pull/23685) | 4x packed Q8_1 activation for Q4_K_M in MMVQ (+Q5_K/Q6_K) | tg128 **+31.9%** Qwen3-4B, **+17.3%** Qwen3-8B, **+54.1%** OLMoE MoE |
+| [#27248](https://github.com/ggml-org/llama.cpp/pull/27248) | CUDA support for q4_1, iq4_nl, q5_0 and q5_1 KV-cache types | quantized-KV decode **+167.9 / +163.7 / +164.8 / +147.5%** |
+| [#27269](https://github.com/ggml-org/llama.cpp/pull/27269) | enable q8_0-K / q4_0-V flash attention vector kernels | quantized-KV decode q8_0/q4_0 **+176.5%** (42.35 → 117.11 t/s) |
+| [#28552](https://github.com/ggml-org/llama.cpp/pull/28552) | size routed MoE MMQ N-tiles from typical expert width | pp512 **+14.6%** OLMoE, **+10.6%** gemma-26B-A4B |
+| [#28398](https://github.com/ggml-org/llama.cpp/pull/28398) | hardware `v_perm_b32` for Q1_0 vec_dot on AMD | tg128 **+77.2%** on Q1_0 (143.6 → 254.6 t/s) |
+| [#25206](https://github.com/ggml-org/llama.cpp/pull/25206) | optimize RWKV7 inference by fusing graph operators | rwkv7-1.5B pp512 **+9.5%**, tg128 **+7.7%** |
+| `RDNA4-MMVQ-XOVER` | *own experiment* — add the missing RDNA4 branch to `ggml_cuda_should_use_mmvq` | batched decode B8 **+67.6%** Qwen3-4B, **+104.8%** Qwen3-8B; B1/B2 and prefill flat |
+| [#26504](https://github.com/ggml-org/llama.cpp/pull/26504) | non-contiguous tensors in CEIL op | no speed change; +5 ops out of `NOT SUPPORTED` |
+| [#28477](https://github.com/ggml-org/llama.cpp/pull/28477) | strided ABS for F16 and F32 | no speed change; +13 ops out of `NOT SUPPORTED` |
+
+The last two ship for **coverage, not speed** — they move shapes off the CPU fallback path.
 
 Apply order and build instructions: **`RELEASE_NOTES_v2.md`**.
 
@@ -302,6 +322,41 @@ MLA-architecture model, move to v2.
 
 ---
 
+## Release v3
+
+**v3 fixes a prefill regression that shipped in both v1 and v2.**
+
+[#25940](https://github.com/ggml-org/llama.cpp/pull/25940)'s RDNA4 table routes `Q6_K` matmuls to hipBLAS above `ne11 = 256`. On gfx1201 that path
+is 2.6x to 6.7x slower than MMQ, so batched prefill lost up to **85%** against the *unpatched*
+base — in every release to date. Neither previous quality gate measured the shape it lived in.
+
+`Qwen3-4B Q4_K_M`, `-fa 1`, prefill throughput (tok/s):
+
+| ne11 | base | v2 (shipped) | v3 |
+|---|---|---|---|
+| 384 | 5,376.65 | **793.92** (−85.2%) | 5,767.70 (+7.3%) |
+| 512 | 5,944.91 | **2,352.14** (−60.4%) | 6,366.96 (+7.1%) |
+| 640 | 5,433.94 | **1,204.93** (−77.8%) | 5,785.50 (+6.5%) |
+| 1024 | 6,190.17 | **3,555.84** (−42.6%) | 6,583.93 (+6.4%) |
+
+**If you run parallel sequences — a server, an agent, batched work — upgrade.** If you only ever
+run one prompt at a time, v2 was about 4 points faster on single-sequence prefill, and v3 gives
+that up deliberately to close the hole.
+
+v3 also retires one of our three non-upstream patches: upstream [#28079](https://github.com/ggml-org/llama.cpp/pull/28079) fixed the root cause our
+`cand_27269_with_hipfix.diff` was working around.
+
+Full detail — seven models, quantized-KV sweep, batched sweep, quality gate, and the limits
+(IQ-quantised models gain almost nothing from this stack):
+**[RELEASE_NOTES_v3.md](RELEASE_NOTES_v3.md)**
+
+v1 and v2 are **left as published**. They have been distributed, and rewriting them is worse than
+shipping a clear correction.
+
+---
+
+---
+
 ## Reproduce
 
 ```bash
@@ -312,11 +367,12 @@ cd ROCm-backalley-release
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp && git checkout 73a43d1 && git tag backalley-base
 
-# 2. apply the stack, in this order
-git apply ../patches/stack_26301.diff
-git apply ../patches/stack_28102.diff
-git apply ../patches/stack_24386.diff
-git apply ../patches/stack_25940.diff
+# 2. apply the stack, in this order (v4 - 18 patches)
+for p in stack_26301 stack_24386 stack_25940 rel_25206 rel_27248 rel_26504 rel_28477 \
+         rel_28079 rel_27269_new pr28552 pr23685_ported cand_RDNA4_MMVQ_XOVER pr28398 \
+         fix_Q6K_always_mmq v4_fa_spill v4_packed_q8_1_layout pr26419 v4_hd256_retune; do
+  git apply ../patches/$p.diff || { echo "FAILED: $p"; break; }
+done
 
 # 3. build (ROCm 7.2 HIP SDK + MSVC 14.44/VS2022)
 cmake -S . -B build-hip -G Ninja -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 \
@@ -325,8 +381,9 @@ cmake -S . -B build-hip -G Ninja -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 \
   -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF
 cmake --build build-hip --target llama-bench
 
-# 4. run - note the env var, without it you lose ~1/3 of the decode gain
+# 4. run - note the env vars, without them you lose ~1/3 of the decode gain
 set GGML_CUDA_DQ_MMV=1
+set GGML_CUDA_DQ_Q6K=1
 set HIP_VISIBLE_DEVICES=0
 build-hip\bin\llama-bench.exe -m <model.gguf> -ngl 99 -p 512 -n 128 -r 3
 ```
@@ -348,23 +405,22 @@ Or **download the prebuilt archive from Releases** — self-contained, no ROCm i
 
 ## Database
 
-`database.csv` — every candidate, its verdict, the numbers, and the reasoning. 66 entries.
+`database.csv` — every candidate, its verdict, the numbers, and the reasoning. 101 entries.
 
 | status | count |
 |---|---|
-| VALIDATED | 14 |
-| NO_EFFECT | 14 |
-| NOT_APPLICABLE | 10 |
+| VALIDATED | 18 |
+| NO_EFFECT | 13 |
+| NOT_APPLICABLE | 12 |
 | NO_REGRESSION_ONLY | 6 |
-| RESOLVED | 4 |
-| CORRECTNESS_ONLY | 2 |
-| DEFERRED | 2 |
-| CONFIRM_ONLY | 2 |
-| NEGLIGIBLE | 2 |
-| COMPLETE | 2 |
-| AWAITING_DECISION / CONDITIONAL / CUDA_ONLY / PASSED / REJECTED / REJECTED_FROM_V2 / SUPERSEDED / UPSTREAM_ISSUE | 1 each |
+| REJECTED | 6 |
+| RESOLVED | 6 |
+| SHIPPED | 5 |
+| COMPLETE | 4 |
+| SUPERSEDED / CORRECTNESS_ONLY / DEFERRED / CONFIRM_ONLY / NEGLIGIBLE / PASSED / FIXED | 2–3 each |
+| 17 further one-off verdicts | 1 each |
 
-**Hit rate: roughly 1 in 5.** Of 66 candidates examined, 12 are in the v2 stack. Several were initially rejected by a mechanical `git apply` check and only recovered by reading the code — including #23685, which needed a hand port, and #27269, which needed a one-line HIP fix the upstream PR omits.
+**Hit rate: roughly 1 in 5.** Of 101 candidates examined, 18 are in the v4 stack. Several were initially rejected by a mechanical `git apply` check and only recovered by reading the code — including #23685, which needed a hand port, and #27269, which needed a one-line HIP fix the upstream PR omits.
 
 ---
 
@@ -373,7 +429,7 @@ Or **download the prebuilt archive from Releases** — self-contained, no ROCm i
 - **One card, one OS, one driver.** RX 9070 (gfx1201), Windows 11, Adrenalin 32.0.31041.1004, ROCm 7.2. Untested on 9070 XT, 9060, R9700, or Linux.
 - **The prebuilt archive is gfx1201-only.** Tensile libraries are filtered to gfx1201 to keep it at 370 MB; it will not work on other AMD architectures.
 - **Five models, 32-chunk perplexity, 150 winogrande tasks.** Enough to catch a broken model; not an exhaustive quality suite.
-- **Four patches, not twenty.** Out of 30 candidates.
+- **Eighteen patches, not a hundred.** Out of 100 candidates examined.
 - Upstream PR numbers, titles and author claims are reproduced in good faith; where our numbers disagree with an author's, both are shown.
 
 ## Credit
